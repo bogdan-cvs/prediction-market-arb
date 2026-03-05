@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 from connectors.unified import UnifiedConnector
+from executor.execution_engine import ExecutionEngine
 from scanner.opportunity_scanner import OpportunityScanner
 
 # Singleton instances — initialized in main.py lifespan
 _connector: UnifiedConnector | None = None
 _scanner: OpportunityScanner | None = None
-_executor = None  # Will be ExecutionEngine, set in Step 7
+_executor: ExecutionEngine | None = None
 
 
 def init_services() -> None:
-    global _connector, _scanner
+    global _connector, _scanner, _executor
     _connector = UnifiedConnector()
     _scanner = OpportunityScanner(_connector)
+    _executor = ExecutionEngine(_connector)
 
 
 def get_connector() -> UnifiedConnector:
@@ -27,12 +29,7 @@ def get_scanner() -> OpportunityScanner:
     return _scanner
 
 
-def set_executor(executor) -> None:
-    global _executor
-    _executor = executor
-
-
-def get_executor():
+def get_executor() -> ExecutionEngine:
     if _executor is None:
         raise RuntimeError("Executor not initialized")
     return _executor
