@@ -66,21 +66,81 @@ class KalshiConnector(BaseConnector):
         if not self._client:
             return []
         try:
-            params: dict[str, Any] = {"limit": min(limit, 200), "status": "open"}
-            if query:
-                params["series_ticker"] = query
+            all_markets: list[NormalizedMarket] = []
+            seen_ids: set[str] = set()
 
-            resp = await self._client.get("/trade-api/v2/markets", params=params)
-            resp.raise_for_status()
-            data = resp.json()
+            # Strategy 1: Fetch events and their sub-markets
+            # Events have clean titles ("Who will be next Pope?"), sub-markets are contracts
+            try:
+                cursor = None
+                pages = 0
+                while pages < 5:
+                    params: dict[str, Any] = {"limit": 50, "status": "open"}
+                    if cursor:
+                        params["cursor"] = cursor
+                    resp = await self._client.get("/trade-api/v2/events", params=params)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    events = data.get("events", [])
+                    if not events:
+                        break
 
-            markets: list[NormalizedMarket] = []
-            for m in data.get("markets", []):
-                market = self._normalize_market(m)
-                if market:
-                    markets.append(market)
-            logger.info("kalshi_markets_fetched", count=len(markets))
-            return markets
+                    for event in events:
+                        event_ticker = event.get("event_ticker", "")
+                        event_title = event.get("title", "")
+                        event_category = event.get("category", "")
+                        if not event_ticker:
+                            continue
+
+                        # Rate limit: small delay between event market requests
+                        await asyncio.sleep(0.2)
+
+                        # Fetch markets for this event
+                        try:
+                            mresp = await self._client.get(
+                                "/trade-api/v2/markets",
+                                params={"event_ticker": event_ticker, "limit": 50, "status": "open"},
+                            )
+                            mresp.raise_for_status()
+                            mdata = mresp.json()
+                            event_markets = mdata.get("markets", [])
+
+                            for m in event_markets:
+                                # Use event title as a prefix if market title is generic
+                                m["_event_title"] = event_title
+                                m["_event_category"] = event_category
+                                market = self._normalize_market(m)
+                                if market and market.platform_market_id not in seen_ids:
+                                    seen_ids.add(market.platform_market_id)
+                                    all_markets.append(market)
+                        except Exception:
+                            pass
+
+                    cursor = data.get("cursor")
+                    if not cursor:
+                        break
+                    pages += 1
+                    await asyncio.sleep(0.5)  # Rate limit between pages
+            except Exception as e:
+                logger.warning("kalshi_events_fetch_failed", error=str(e))
+
+            # Strategy 2: Fetch key crypto series specifically
+            for series in ["KXBTC", "KXETH"]:
+                try:
+                    params = {"limit": 50, "status": "open", "series_ticker": series}
+                    resp = await self._client.get("/trade-api/v2/markets", params=params)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    for m in data.get("markets", []):
+                        market = self._normalize_market(m)
+                        if market and market.platform_market_id not in seen_ids:
+                            seen_ids.add(market.platform_market_id)
+                            all_markets.append(market)
+                except Exception as e:
+                    logger.warning("kalshi_series_fetch_failed", series=series, error=str(e))
+
+            logger.info("kalshi_markets_fetched", count=len(all_markets))
+            return all_markets
         except Exception as e:
             logger.error("kalshi_get_markets_failed", error=str(e))
             return []
@@ -163,6 +223,18 @@ class KalshiConnector(BaseConnector):
         try:
             ticker = raw.get("ticker", "")
             title = raw.get("title", raw.get("subtitle", ticker))
+            # Use event title if market title is too generic or same as event
+            event_title = raw.get("_event_title", "")
+            event_category = raw.get("_event_category", "")
+            if event_title and title == event_title:
+                pass
+            elif event_title and not title:
+                title = event_title
+
+            # Skip parlay/combo markets (multi-leg bets with comma-separated outcomes)
+            if title and (title.startswith("yes ") or title.startswith("no ") or title.count(",yes ") >= 1 or title.count(",no ") >= 1):
+                return None
+
             yes_ask = raw.get("yes_ask")
             yes_bid = raw.get("yes_bid")
             no_ask = raw.get("no_ask")
@@ -187,7 +259,7 @@ class KalshiConnector(BaseConnector):
                 platform_market_id=ticker,
                 ticker=ticker,
                 title=title,
-                category=raw.get("category", ""),
+                category=raw.get("category", "") or raw.get("_event_category", ""),
                 yes_ask_cents=yes_ask,
                 yes_bid_cents=yes_bid,
                 no_ask_cents=no_ask,
@@ -201,18 +273,29 @@ class KalshiConnector(BaseConnector):
             return None
 
     def _parse_orderbook(self, data: dict[str, Any]) -> OrderBook:
-        def parse_levels(levels: list | None) -> list[OrderBookLevel]:
-            if not levels:
+        def parse_levels(levels) -> list[OrderBookLevel]:
+            if not levels or not isinstance(levels, list):
                 return []
-            return [
-                OrderBookLevel(price_cents=int(lv[0]), quantity=int(lv[1]))
-                for lv in levels
-                if len(lv) >= 2
-            ]
+            result = []
+            for lv in levels:
+                if isinstance(lv, (list, tuple)) and len(lv) >= 2:
+                    price = int(lv[0])
+                    qty = int(lv[1])
+                    if 1 <= price <= 99 and qty > 0:
+                        result.append(OrderBookLevel(price_cents=price, quantity=qty))
+            return result
+
+        # Kalshi v2 orderbook: {"yes": [[price, qty], ...], "no": [[price, qty], ...]}
+        yes_raw = data.get("yes")
+        no_raw = data.get("no")
+
+        # Handle both list format and dict format
+        if isinstance(yes_raw, dict):
+            yes_raw = yes_raw.get("asks", [])
+        if isinstance(no_raw, dict):
+            no_raw = no_raw.get("asks", [])
 
         return OrderBook(
-            yes_asks=parse_levels(data.get("yes", {}).get("asks")),
-            yes_bids=parse_levels(data.get("yes", {}).get("bids")),
-            no_asks=parse_levels(data.get("no", {}).get("asks")),
-            no_bids=parse_levels(data.get("no", {}).get("bids")),
+            yes_asks=parse_levels(yes_raw),
+            no_asks=parse_levels(no_raw),
         )

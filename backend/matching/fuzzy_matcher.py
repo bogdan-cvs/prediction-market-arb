@@ -14,7 +14,7 @@ from models.market import MatchedMarket, NormalizedMarket, Platform
 logger = structlog.get_logger()
 
 # Minimum similarity score (0-100) for fuzzy match fallback
-MIN_FUZZY_SCORE = 85.0
+MIN_FUZZY_SCORE = 75.0
 
 
 def find_matches(
@@ -24,8 +24,8 @@ def find_matches(
 
     Strategy:
     1. Extract entities (asset, date, threshold, direction) from each market
-    2. Exact match on (asset + date + threshold)
-    3. Fallback: fuzzy string similarity on cleaned titles
+    2. Exact match on (asset + date + threshold) for structured markets
+    3. High fuzzy text similarity for unstructured markets (politics, entertainment)
     """
     # Build entity index per market
     indexed: list[tuple[NormalizedMarket, dict[str, Any]]] = []
@@ -46,14 +46,11 @@ def find_matches(
 
     # Group by entity key for exact matching
     entity_groups: dict[str, list[tuple[NormalizedMarket, dict[str, Any]]]] = {}
-    unmatched: list[tuple[NormalizedMarket, dict[str, Any]]] = []
 
     for market, entities in indexed:
         key = _entity_key(entities)
         if key:
             entity_groups.setdefault(key, []).append((market, entities))
-        else:
-            unmatched.append((market, entities))
 
     matches: list[MatchedMarket] = []
 
@@ -61,7 +58,6 @@ def find_matches(
     for key, group in entity_groups.items():
         platforms_in_group: dict[Platform, NormalizedMarket] = {}
         for market, _ in group:
-            # Take the first market per platform in the group
             if market.platform not in platforms_in_group:
                 platforms_in_group[market.platform] = market
 
@@ -79,8 +75,7 @@ def find_matches(
                 platforms=[p.value for p in platforms_in_group],
             )
 
-    # Phase 2: Fuzzy matching for unmatched markets
-    # Also try fuzzy between different entity groups
+    # Phase 2: Fuzzy matching for all cross-platform pairs
     matched_ids = set()
     for m in matches:
         for market in m.markets.values():
@@ -93,12 +88,12 @@ def find_matches(
 
     # Cross-platform fuzzy matching on remaining
     for i, (market_a, ent_a) in enumerate(remaining):
+        if (market_a.platform, market_a.platform_market_id) in matched_ids:
+            continue
         for j, (market_b, ent_b) in enumerate(remaining):
             if j <= i:
                 continue
             if market_a.platform == market_b.platform:
-                continue
-            if (market_a.platform, market_a.platform_market_id) in matched_ids:
                 continue
             if (market_b.platform, market_b.platform_market_id) in matched_ids:
                 continue
@@ -120,8 +115,8 @@ def find_matches(
                 logger.debug(
                     "fuzzy_match_found",
                     score=score,
-                    a=market_a.title[:50],
-                    b=market_b.title[:50],
+                    a=market_a.title[:60],
+                    b=market_b.title[:60],
                 )
 
     logger.info("matching_complete", total_matches=len(matches))
@@ -156,29 +151,53 @@ def _fuzzy_score(
     market_b: NormalizedMarket,
     ent_b: dict[str, Any],
 ) -> float:
-    """Compute similarity score between two markets."""
+    """Compute similarity score between two markets.
+
+    For structured markets (crypto prices): uses entity matching.
+    For unstructured markets (politics, entertainment): uses text similarity.
+    """
+    has_asset_a = bool(ent_a.get("asset"))
+    has_asset_b = bool(ent_b.get("asset"))
+
+    # If both have assets, use structured matching
+    if has_asset_a and has_asset_b:
+        return _structured_score(market_a, ent_a, market_b, ent_b)
+
+    # If one has an asset and the other doesn't, unlikely match
+    if has_asset_a != has_asset_b:
+        # Still allow if text similarity is very high
+        text_score = _text_similarity(market_a.title, market_b.title)
+        return text_score if text_score >= 85.0 else 0.0
+
+    # Neither has an asset — use pure text similarity (politics, entertainment, etc.)
+    return _text_similarity(market_a.title, market_b.title)
+
+
+def _structured_score(
+    market_a: NormalizedMarket,
+    ent_a: dict[str, Any],
+    market_b: NormalizedMarket,
+    ent_b: dict[str, Any],
+) -> float:
+    """Score for structured markets (crypto, financial)."""
     score = 0.0
 
-    # Asset match is weighted heavily
-    if ent_a["asset"] and ent_b["asset"]:
-        if ent_a["asset"] == ent_b["asset"]:
-            score += 40.0
-        else:
-            return 0.0  # Different assets = no match
+    if ent_a["asset"] != ent_b["asset"]:
+        return 0.0  # Different assets = no match
+    score += 40.0
 
     # Threshold match
     if ent_a["threshold"] is not None and ent_b["threshold"] is not None:
         if ent_a["threshold"] == ent_b["threshold"]:
             score += 30.0
         else:
-            # Close enough? Within 1%
-            ratio = min(ent_a["threshold"], ent_b["threshold"]) / max(
-                ent_a["threshold"], ent_b["threshold"]
-            )
-            if ratio > 0.99:
-                score += 20.0
-            else:
-                return score  # Different thresholds
+            max_val = max(ent_a["threshold"], ent_b["threshold"])
+            if max_val > 0:
+                ratio = min(ent_a["threshold"], ent_b["threshold"]) / max_val
+                if ratio > 0.99:
+                    score += 20.0
+                else:
+                    return score  # Different thresholds
 
     # Date match
     if ent_a["date"] and ent_b["date"]:
@@ -192,11 +211,46 @@ def _fuzzy_score(
         if ent_a["direction"] == ent_b["direction"]:
             score += 10.0
 
-    # Fuzzy text similarity as tiebreaker
-    text_score = fuzz.token_sort_ratio(
-        ent_a.get("clean_text", market_a.title),
-        ent_b.get("clean_text", market_b.title),
-    )
-    score += text_score * 0.1  # Weight text similarity lower
+    # Text similarity bonus
+    text_score = _text_similarity(market_a.title, market_b.title)
+    score += text_score * 0.1
 
     return min(score, 100.0)
+
+
+def _text_similarity(title_a: str, title_b: str) -> float:
+    """Compute text similarity between two market titles."""
+    clean_a = _clean_for_comparison(title_a)
+    clean_b = _clean_for_comparison(title_b)
+
+    # Use token_sort_ratio as primary (order-independent full comparison)
+    sort_score = fuzz.token_sort_ratio(clean_a, clean_b)
+
+    # token_set_ratio is too aggressive (subset matching) — only use if
+    # lengths are similar (within 2x) to avoid "GTA VI" matching everything
+    set_score = 0.0
+    len_a, len_b = len(clean_a), len(clean_b)
+    if len_a > 0 and len_b > 0:
+        length_ratio = min(len_a, len_b) / max(len_a, len_b)
+        if length_ratio > 0.4:
+            set_score = fuzz.token_set_ratio(clean_a, clean_b) * length_ratio
+
+    return max(sort_score, set_score)
+
+
+def _clean_for_comparison(text: str) -> str:
+    """Clean a market title for fuzzy comparison."""
+    import re
+    text = text.lower().strip()
+    # Remove punctuation
+    text = re.sub(r"[?!.,;:\"'()\[\]{}]", " ", text)
+    # Remove common noise words
+    noise = {
+        "will", "be", "the", "on", "at", "or", "by", "end", "of",
+        "close", "closing", "price", "market", "contract", "a", "an",
+        "in", "to", "for", "and", "is", "are", "was", "were", "this",
+        "that", "what", "which", "who", "whom", "when", "where", "how",
+    }
+    words = text.split()
+    words = [w for w in words if w not in noise]
+    return " ".join(words)

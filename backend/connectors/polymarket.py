@@ -56,25 +56,56 @@ class PolymarketConnector(BaseConnector):
         if not self._gamma_client:
             return []
         try:
-            params: dict[str, Any] = {
-                "limit": min(limit, 100),
-                "active": "true",
-                "closed": "false",
-            }
-            if query:
-                params["tag"] = query
-
-            resp = await self._gamma_client.get("/markets", params=params)
-            resp.raise_for_status()
-            raw_markets = resp.json()
-
             markets: list[NormalizedMarket] = []
-            for m in raw_markets:
-                normalized = self._normalize_market(m)
-                markets.extend(normalized)
 
-            logger.info("polymarket_markets_fetched", count=len(markets))
-            return markets
+            # Fetch multiple pages of events for broader coverage
+            for offset in range(0, 200, 50):
+                try:
+                    params: dict[str, Any] = {
+                        "limit": 50,
+                        "offset": offset,
+                        "active": "true",
+                        "closed": "false",
+                    }
+                    resp = await self._gamma_client.get("/events", params=params)
+                    resp.raise_for_status()
+                    events = resp.json()
+                    if not events:
+                        break
+                    for event in events:
+                        for m in event.get("markets", []):
+                            if not m.get("active") or m.get("closed"):
+                                continue
+                            normalized = self._normalize_market(m)
+                            markets.extend(normalized)
+                except Exception as e:
+                    logger.warning("polymarket_events_page_failed", offset=offset, error=str(e))
+                    break
+
+            # Also fetch direct markets endpoint for broader coverage
+            try:
+                resp2 = await self._gamma_client.get("/markets", params={
+                    "limit": 100,
+                    "active": "true",
+                    "closed": "false",
+                })
+                resp2.raise_for_status()
+                for m in resp2.json():
+                    normalized = self._normalize_market(m)
+                    markets.extend(normalized)
+            except Exception as e:
+                logger.warning("polymarket_markets_fetch_failed", error=str(e))
+
+            # Deduplicate by market_id
+            seen: set[str] = set()
+            unique: list[NormalizedMarket] = []
+            for m in markets:
+                if m.platform_market_id not in seen:
+                    seen.add(m.platform_market_id)
+                    unique.append(m)
+
+            logger.info("polymarket_markets_fetched", count=len(unique))
+            return unique
         except Exception as e:
             logger.error("polymarket_get_markets_failed", error=str(e))
             return []
@@ -168,10 +199,23 @@ class PolymarketConnector(BaseConnector):
                 status = MarketStatus.UNKNOWN
 
             # Each market has tokens (YES/NO outcomes)
+            import json as _json
             tokens = raw.get("tokens", [])
             clob_token_ids = raw.get("clobTokenIds", [])
             outcomes = raw.get("outcomes", ["Yes", "No"])
             outcome_prices = raw.get("outcomePrices", [])
+
+            # These fields can be JSON strings instead of lists
+            if isinstance(clob_token_ids, str):
+                try:
+                    clob_token_ids = _json.loads(clob_token_ids)
+                except (ValueError, TypeError):
+                    clob_token_ids = []
+            if isinstance(outcomes, str):
+                try:
+                    outcomes = _json.loads(outcomes)
+                except (ValueError, TypeError):
+                    outcomes = ["Yes", "No"]
 
             # Use the first token (YES) as the market representation
             yes_token_id = ""
@@ -188,6 +232,10 @@ class PolymarketConnector(BaseConnector):
 
             if outcome_prices:
                 try:
+                    # outcomePrices can be a JSON string or a list
+                    import json as _json
+                    if isinstance(outcome_prices, str):
+                        outcome_prices = _json.loads(outcome_prices)
                     prices = [float(p) for p in outcome_prices if p]
                     if len(prices) >= 1:
                         yes_price = int(prices[0] * 100)
@@ -208,7 +256,7 @@ class PolymarketConnector(BaseConnector):
                 yes_ask_cents=yes_price,
                 no_ask_cents=no_price,
                 status=status,
-                volume=int(raw.get("volume", 0) or 0),
+                volume=int(float(raw.get("volume", 0) or 0)),
                 expiration=expiration,
             )
             results.append(market)

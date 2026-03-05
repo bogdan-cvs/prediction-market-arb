@@ -142,6 +142,10 @@ class OpportunityScanner:
         if price_a is None or price_b is None:
             return None
 
+        # Prices must be valid (1-99 cents range)
+        if price_a < 1 or price_a > 99 or price_b < 1 or price_b > 99:
+            return None
+
         total_cost = price_a + price_b
         if total_cost >= 100:
             return None  # No arbitrage

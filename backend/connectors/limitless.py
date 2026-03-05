@@ -18,7 +18,7 @@ from models.market import (
 
 logger = structlog.get_logger()
 
-API_BASE = "https://api.limitless.exchange/api-v1"
+API_BASE = "https://api.limitless.exchange"
 
 
 class LimitlessConnector(BaseConnector):
@@ -50,11 +50,11 @@ class LimitlessConnector(BaseConnector):
         if not self._client:
             return []
         try:
-            params: dict[str, Any] = {"limit": min(limit, 100), "status": "active"}
+            params: dict[str, Any] = {}
             if query:
                 params["query"] = query
 
-            resp = await self._client.get("/markets", params=params)
+            resp = await self._client.get("/markets/active", params=params)
             resp.raise_for_status()
             raw_markets = resp.json()
 
@@ -128,39 +128,54 @@ class LimitlessConnector(BaseConnector):
             if not title or not market_id:
                 return None
 
-            # Parse prices
-            yes_price = raw.get("yesPrice") or raw.get("yes_price")
-            no_price = raw.get("noPrice") or raw.get("no_price")
-
+            # Parse prices — new API uses "prices" array [yes_price, no_price] as floats 0-1
+            prices = raw.get("prices", [])
             yes_cents = None
             no_cents = None
-            if yes_price is not None:
-                yes_cents = int(float(yes_price) * 100) if float(yes_price) < 1.5 else int(yes_price)
-            if no_price is not None:
-                no_cents = int(float(no_price) * 100) if float(no_price) < 1.5 else int(no_price)
 
-            # Parse expiration
-            exp = raw.get("expirationDate") or raw.get("deadline") or raw.get("endDate")
+            if prices and len(prices) >= 2:
+                yes_cents = int(float(prices[0]) * 100)
+                no_cents = int(float(prices[1]) * 100)
+            else:
+                # Fallback to old field names
+                yes_price = raw.get("yesPrice") or raw.get("yes_price")
+                no_price = raw.get("noPrice") or raw.get("no_price")
+                if yes_price is not None:
+                    yes_cents = int(float(yes_price) * 100) if float(yes_price) < 1.5 else int(yes_price)
+                if no_price is not None:
+                    no_cents = int(float(no_price) * 100) if float(no_price) < 1.5 else int(no_price)
+
+            # Parse expiration — new API uses expirationTimestamp (ms) or expirationDate string
             expiration = None
-            if exp:
+            exp_ts = raw.get("expirationTimestamp")
+            if exp_ts:
                 try:
-                    if isinstance(exp, (int, float)):
-                        expiration = datetime.utcfromtimestamp(exp)
-                    else:
-                        expiration = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
+                    expiration = datetime.utcfromtimestamp(int(exp_ts) / 1000)
                 except (ValueError, TypeError, OSError):
                     pass
 
+            if not expiration:
+                exp = raw.get("expirationDate") or raw.get("deadline") or raw.get("endDate")
+                if exp:
+                    try:
+                        if isinstance(exp, (int, float)):
+                            expiration = datetime.utcfromtimestamp(exp)
+                        else:
+                            expiration = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
+                    except (ValueError, TypeError, OSError):
+                        pass
+
             status_raw = raw.get("status", "active")
-            if status_raw in ("active", "open"):
+            if status_raw in ("active", "open", "FUNDED"):
                 status = MarketStatus.OPEN
             elif status_raw in ("resolved", "settled"):
                 status = MarketStatus.SETTLED
             else:
                 status = MarketStatus.UNKNOWN
 
-            category = raw.get("category", raw.get("tag", ""))
-            volume = int(raw.get("volume", 0) or 0)
+            categories = raw.get("categories", [])
+            category = ", ".join(categories) if categories else raw.get("category", raw.get("tag", ""))
+            volume = int(float(raw.get("volume", 0) or 0))
 
             return NormalizedMarket(
                 platform=Platform.LIMITLESS,

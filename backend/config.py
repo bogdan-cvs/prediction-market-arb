@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     # Kalshi
     kalshi_api_key: str = ""
     kalshi_private_key_path: str = "./keys/kalshi_private.pem"
-    kalshi_base_url: str = "https://demo-api.kalshi.com"
+    kalshi_base_url: str = "https://api.elections.kalshi.com"
 
     # Polymarket
     polymarket_private_key: str = ""

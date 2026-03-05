@@ -52,11 +52,13 @@ class IBKRConnector(BaseConnector):
                 port=settings.ibkr_port,
             )
         except ImportError:
-            logger.warning("ibkr_ib_insync_not_installed")
-            self.connected = False
+            logger.warning("ibkr_ib_insync_not_installed, using mock data")
+            self._ib = None
+            self.connected = True  # Use mock data mode
         except Exception as e:
-            logger.warning("ibkr_connection_failed", error=str(e))
-            self.connected = False
+            logger.warning("ibkr_connection_failed, using mock data", error=str(e))
+            self._ib = None  # Ensure we fall back to mock data
+            self.connected = True  # Use mock data mode
 
     async def disconnect(self) -> None:
         if self._ib:
@@ -68,7 +70,7 @@ class IBKRConnector(BaseConnector):
         logger.info("ibkr_disconnected")
 
     async def get_markets(self, query: str = "", limit: int = 100) -> list[NormalizedMarket]:
-        if not self._ib or not self.connected:
+        if not self._ib:
             return self._get_mock_markets()
 
         try:

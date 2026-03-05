@@ -87,18 +87,21 @@ def extract_entities(text: str) -> dict[str, Any]:
 
 def _extract_asset(text: str) -> str:
     """Extract asset identifier from text."""
-    # Try ticker-style patterns first: KXBTC, FXBTC, etc.
-    ticker_match = re.search(r"(?:KX|FX|PX|LX)?([A-Z]{2,5})", text.upper())
-
-    # Check known aliases
+    # Check known aliases — require word boundaries to avoid "MegaETH" -> "ETH"
     for alias, canonical in sorted(ASSET_ALIASES.items(), key=lambda x: -len(x[0])):
-        if alias in text:
+        pattern = rf"(?:^|\b|\$){re.escape(alias)}(?:\b|$)"
+        if re.search(pattern, text, re.IGNORECASE):
             return canonical
 
-    # Try to find standalone tickers
-    token_match = re.search(r"\b(BTC|ETH|SOL|SPY|QQQ|XRP|DOGE|ADA|DOT|AVAX)\b", text.upper())
+    # Try to find standalone tickers with word boundaries
+    token_match = re.search(r"(?:^|\b|\$)(BTC|ETH|SOL|SPY|QQQ|XRP|DOGE|ADA|DOT|AVAX)\b", text.upper())
     if token_match:
         return token_match.group(1)
+
+    # Try ticker-style patterns: KXBTC, FXBTC, etc.
+    ticker_match = re.search(r"(?:KX|FX|PX|LX)(BTC|ETH|SOL|SPY|QQQ|FED)", text.upper())
+    if ticker_match:
+        return ticker_match.group(1)
 
     return ""
 
