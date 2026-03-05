@@ -1,0 +1,14 @@
+fastapi==0.115.*
+uvicorn[standard]==0.34.*
+websockets==13.*
+pydantic==2.*
+pydantic-settings==2.*
+httpx==0.28.*
+aiohttp==3.*
+kalshi-python
+py-clob-client
+ib_insync
+rapidfuzz==3.*
+structlog==24.*
+aiosqlite==0.20.*
+python-dotenv==1.*
