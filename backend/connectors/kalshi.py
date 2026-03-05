@@ -69,93 +69,65 @@ class KalshiConnector(BaseConnector):
             all_markets: list[NormalizedMarket] = []
             seen_ids: set[str] = set()
 
-            # Strategy 1: Fetch all events (sequential pages), then fetch
-            # per-event markets concurrently with a semaphore
-            try:
-                # Phase A: collect all events
-                all_events: list[dict] = []
-                cursor = None
-                pages = 0
-                while pages < 5:
-                    params: dict[str, Any] = {"limit": 50, "status": "open"}
-                    if cursor:
-                        params["cursor"] = cursor
-                    resp = await self._client.get("/trade-api/v2/events", params=params)
-                    resp.raise_for_status()
-                    data = resp.json()
-                    events = data.get("events", [])
-                    if not events:
-                        break
-                    all_events.extend(events)
-                    cursor = data.get("cursor")
-                    if not cursor:
-                        break
-                    pages += 1
+            # Fetch events with nested markets (limit=200 per page).
+            # Replaces the old per-event market fetch (~250 calls / ~80s)
+            # with ~10 paginated calls in ~4s.
+            cursor = None
+            pages = 0
+            while pages < 5:
+                params: dict[str, Any] = {
+                    "limit": 200,
+                    "status": "open",
+                    "with_nested_markets": "true",
+                }
+                if cursor:
+                    params["cursor"] = cursor
 
-                # Phase B: fetch per-event markets in batches of 5 with delay
-                BATCH_SIZE = 5
-
-                async def _fetch_event_markets(event: dict) -> list[dict]:
-                    event_ticker = event.get("event_ticker", "")
-                    if not event_ticker:
-                        return []
-                    for attempt in range(3):
-                        try:
-                            mresp = await self._client.get(
-                                "/trade-api/v2/markets",
-                                params={"event_ticker": event_ticker, "limit": 50, "status": "open"},
-                            )
-                            if mresp.status_code == 429:
-                                await asyncio.sleep(1.0 * (attempt + 1))
-                                continue
-                            mresp.raise_for_status()
-                            result = []
-                            for m in mresp.json().get("markets", []):
-                                m["_event_title"] = event.get("title", "")
-                                m["_event_category"] = event.get("category", "")
-                                result.append(m)
-                            return result
-                        except Exception:
-                            if attempt < 2:
-                                await asyncio.sleep(0.5)
+                resp = None
+                for attempt in range(3):
+                    try:
+                        resp = await self._client.get("/trade-api/v2/events", params=params)
+                        if resp.status_code == 429:
+                            await asyncio.sleep(1.0 * (attempt + 1))
                             continue
-                    return []
+                        resp.raise_for_status()
+                        break
+                    except httpx.HTTPStatusError:
+                        raise
+                    except Exception:
+                        if attempt < 2:
+                            await asyncio.sleep(0.5)
+                        else:
+                            raise
 
-                # Process in batches: 5 concurrent, 0.3s between batches
-                all_raw: list[dict] = []
-                for i in range(0, len(all_events), BATCH_SIZE):
-                    batch = all_events[i:i + BATCH_SIZE]
-                    batch_results = await asyncio.gather(
-                        *[_fetch_event_markets(ev) for ev in batch]
-                    )
-                    for market_list in batch_results:
-                        all_raw.extend(market_list)
-                    if i + BATCH_SIZE < len(all_events):
-                        await asyncio.sleep(0.3)
+                if resp is None:
+                    break
 
-                for m in all_raw:
-                    market = self._normalize_market(m)
-                    if market and market.platform_market_id not in seen_ids:
-                        seen_ids.add(market.platform_market_id)
-                        all_markets.append(market)
+                data = resp.json()
+                events = data.get("events", [])
+                if not events:
+                    break
 
-            except Exception as e:
-                logger.warning("kalshi_events_fetch_failed", error=str(e))
-
-            # Strategy 2: Fetch key crypto series specifically
-            for series in ["KXBTC", "KXETH"]:
-                try:
-                    params = {"limit": 50, "status": "open", "series_ticker": series}
-                    resp = await self._client.get("/trade-api/v2/markets", params=params)
-                    resp.raise_for_status()
-                    data = resp.json()
-                    for m in data.get("markets", []):
+                for event in events:
+                    event_title = event.get("title", "")
+                    event_category = event.get("category", "")
+                    for m in event.get("markets", []):
+                        # Skip non-active markets and markets with zero liquidity
+                        if m.get("status") != "active":
+                            continue
+                        if not m.get("yes_ask") and not m.get("yes_bid"):
+                            continue
+                        m["_event_title"] = event_title
+                        m["_event_category"] = event_category
                         market = self._normalize_market(m)
                         if market and market.platform_market_id not in seen_ids:
                             seen_ids.add(market.platform_market_id)
                             all_markets.append(market)
-                except Exception as e:
-                    logger.warning("kalshi_series_fetch_failed", series=series, error=str(e))
+
+                cursor = data.get("cursor")
+                if not cursor:
+                    break
+                pages += 1
 
             logger.info("kalshi_markets_fetched", count=len(all_markets))
             return all_markets
@@ -260,6 +232,7 @@ class KalshiConnector(BaseConnector):
 
             status_map = {
                 "open": MarketStatus.OPEN,
+                "active": MarketStatus.OPEN,
                 "closed": MarketStatus.CLOSED,
                 "settled": MarketStatus.SETTLED,
             }
