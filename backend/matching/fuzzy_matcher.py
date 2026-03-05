@@ -75,49 +75,74 @@ def find_matches(
                 platforms=[p.value for p in platforms_in_group],
             )
 
-    # Phase 2: Fuzzy matching for all cross-platform pairs
+    # Phase 2: Fuzzy matching — only cross-platform pairs
     matched_ids = set()
     for m in matches:
         for market in m.markets.values():
             matched_ids.add((market.platform, market.platform_market_id))
 
-    remaining: list[tuple[NormalizedMarket, dict[str, Any]]] = []
+    # Group remaining by platform for efficient cross-platform comparison
+    by_platform: dict[Platform, list[tuple[NormalizedMarket, dict[str, Any]]]] = {}
     for market, entities in indexed:
         if (market.platform, market.platform_market_id) not in matched_ids:
-            remaining.append((market, entities))
+            by_platform.setdefault(market.platform, []).append((market, entities))
 
-    # Cross-platform fuzzy matching on remaining
-    for i, (market_a, ent_a) in enumerate(remaining):
-        if (market_a.platform, market_a.platform_market_id) in matched_ids:
-            continue
-        for j, (market_b, ent_b) in enumerate(remaining):
-            if j <= i:
-                continue
-            if market_a.platform == market_b.platform:
-                continue
-            if (market_b.platform, market_b.platform_market_id) in matched_ids:
-                continue
+    platform_list = list(by_platform.keys())
 
-            score = _fuzzy_score(market_a, ent_a, market_b, ent_b)
-            if score >= MIN_FUZZY_SCORE:
-                match = MatchedMarket(
-                    match_id=str(uuid.uuid4())[:12],
-                    markets={
-                        market_a.platform: market_a,
-                        market_b.platform: market_b,
-                    },
-                    match_score=score / 100.0,
-                    verified=False,
+    # Compare each platform pair (not within same platform)
+    for pi in range(len(platform_list)):
+        for pj in range(pi + 1, len(platform_list)):
+            plat_a = platform_list[pi]
+            plat_b = platform_list[pj]
+            group_a = by_platform[plat_a]
+            group_b = by_platform[plat_b]
+
+            # Use rapidfuzz batch extraction for speed: for each market in A,
+            # find best match in B using cleaned titles
+            from rapidfuzz import process as rfprocess
+
+            # Build lookup for B
+            b_titles = [_clean_for_comparison(m.title) for m, _ in group_b]
+            b_lookup = list(range(len(group_b)))
+
+            for idx_a, (market_a, ent_a) in enumerate(group_a):
+                if (market_a.platform, market_a.platform_market_id) in matched_ids:
+                    continue
+
+                clean_a = _clean_for_comparison(market_a.title)
+                # Use rapidfuzz extractBests for batch comparison
+                results = rfprocess.extract(
+                    clean_a, b_titles, scorer=fuzz.token_sort_ratio,
+                    score_cutoff=MIN_FUZZY_SCORE - 5, limit=3,
                 )
-                matches.append(match)
-                matched_ids.add((market_a.platform, market_a.platform_market_id))
-                matched_ids.add((market_b.platform, market_b.platform_market_id))
-                logger.debug(
-                    "fuzzy_match_found",
-                    score=score,
-                    a=market_a.title[:60],
-                    b=market_b.title[:60],
-                )
+
+                for title_b, raw_score, idx_b in results:
+                    market_b, ent_b = group_b[idx_b]
+                    if (market_b.platform, market_b.platform_market_id) in matched_ids:
+                        continue
+
+                    # Re-score with full logic (handles entity matching, length guards)
+                    score = _fuzzy_score(market_a, ent_a, market_b, ent_b)
+                    if score >= MIN_FUZZY_SCORE:
+                        match = MatchedMarket(
+                            match_id=str(uuid.uuid4())[:12],
+                            markets={
+                                market_a.platform: market_a,
+                                market_b.platform: market_b,
+                            },
+                            match_score=score / 100.0,
+                            verified=False,
+                        )
+                        matches.append(match)
+                        matched_ids.add((market_a.platform, market_a.platform_market_id))
+                        matched_ids.add((market_b.platform, market_b.platform_market_id))
+                        logger.debug(
+                            "fuzzy_match_found",
+                            score=score,
+                            a=market_a.title[:60],
+                            b=market_b.title[:60],
+                        )
+                        break  # Market A matched, move to next
 
     logger.info("matching_complete", total_matches=len(matches))
     return matches

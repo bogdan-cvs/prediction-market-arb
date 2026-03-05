@@ -121,6 +121,11 @@ class PolymarketConnector(BaseConnector):
             resp.raise_for_status()
             data = resp.json()
             return self._parse_orderbook(data)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                raise  # Let scanner cache this as permanently failed
+            logger.error("polymarket_orderbook_failed", market=market_id, error=str(e))
+            return OrderBook()
         except Exception as e:
             logger.error("polymarket_orderbook_failed", market=market_id, error=str(e))
             return OrderBook()

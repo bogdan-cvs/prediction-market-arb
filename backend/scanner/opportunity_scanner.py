@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from itertools import combinations
 from typing import Any
@@ -28,16 +29,22 @@ class OpportunityScanner:
         self.active_matches: list[MatchedMarket] = []
         self.opportunities: list[ArbitrageOpportunity] = []
         self._running = False
+        self._ob_fail_cache: set[tuple[str, str]] = set()  # (platform, market_id) that 404
 
     async def refresh_matches(self) -> list[MatchedMarket]:
         """Fetch markets from all platforms and find cross-platform matches."""
+        t0 = time.monotonic()
+        self._ob_fail_cache.clear()  # Reset failed orderbooks on refresh
         markets_by_platform = await self.connector.get_all_markets()
+        t_fetch = time.monotonic() - t0
 
         if not any(markets_by_platform.values()):
             logger.warning("no_markets_fetched")
             return []
 
+        t1 = time.monotonic()
         self.active_matches = find_matches(markets_by_platform)
+        t_match = time.monotonic() - t1
 
         # Save to cache
         for match in self.active_matches:
@@ -47,71 +54,88 @@ class OpportunityScanner:
             "matches_refreshed",
             match_count=len(self.active_matches),
             platforms={p.value: len(m) for p, m in markets_by_platform.items()},
+            fetch_sec=round(t_fetch, 1),
+            match_sec=round(t_match, 2),
         )
         return self.active_matches
 
+    @staticmethod
+    def _orderbook_id(market: NormalizedMarket) -> str:
+        """Return the ID to use when fetching an orderbook.
+
+        Polymarket CLOB API requires the YES token_id (stored in ticker),
+        not the conditionId (stored in platform_market_id).
+        """
+        if market.platform == Platform.POLYMARKET and market.ticker:
+            return market.ticker
+        return market.platform_market_id
+
     async def scan_once(self) -> list[ArbitrageOpportunity]:
         """Run a single scan cycle across all matched markets."""
-        opportunities: list[ArbitrageOpportunity] = []
-
+        t0 = time.monotonic()
+        # Phase 1: collect all unique (platform, orderbook_id) pairs we need orderbooks for
+        ob_keys: list[tuple[Platform, str]] = []
+        seen_ob: set[tuple[str, str]] = set()
         for match in self.active_matches:
-            match_opps = await self._scan_match(match)
-            opportunities.extend(match_opps)
+            for platform, market in match.markets.items():
+                ob_id = self._orderbook_id(market)
+                key = (platform.value, ob_id)
+                if key not in seen_ob:
+                    seen_ob.add(key)
+                    ob_keys.append((platform, ob_id))
 
-        # Sort by net profit descending
+        # Phase 2: fetch ALL orderbooks concurrently (semaphore = 20)
+        sem = asyncio.Semaphore(20)
+
+        async def _fetch_ob(plat: Platform, mid: str) -> tuple[str, str, OrderBook]:
+            cache_key = (plat.value, mid)
+            if cache_key in self._ob_fail_cache:
+                return (plat.value, mid, OrderBook())
+            async with sem:
+                return (plat.value, mid, await self._fetch_orderbook(plat, mid))
+
+        results = await asyncio.gather(*[_fetch_ob(p, m) for p, m in ob_keys])
+        ob_map: dict[tuple[str, str], OrderBook] = {}
+        for pval, mid, ob in results:
+            ob_map[(pval, mid)] = ob
+
+        # Phase 3: evaluate all matches using pre-fetched orderbooks
+        opportunities: list[ArbitrageOpportunity] = []
+        for match in self.active_matches:
+            platforms = list(match.markets.keys())
+            if len(platforms) < 2:
+                continue
+            for plat_a, plat_b in combinations(platforms, 2):
+                market_a = match.markets[plat_a]
+                market_b = match.markets[plat_b]
+                ob_a = ob_map.get((plat_a.value, self._orderbook_id(market_a)), OrderBook())
+                ob_b = ob_map.get((plat_b.value, self._orderbook_id(market_b)), OrderBook())
+
+                for side_a, side_b in [("YES", "NO"), ("NO", "YES")]:
+                    opp = self._evaluate_pair(
+                        match, plat_a, market_a, ob_a, side_a, plat_b, market_b, ob_b, side_b
+                    )
+                    if opp:
+                        opportunities.append(opp)
+
         opportunities.sort(key=lambda o: o.net_profit_cents, reverse=True)
         self.opportunities = opportunities
 
+        elapsed = round(time.monotonic() - t0, 2)
+        skipped = len([k for k in ob_keys if (k[0].value, k[1]) in self._ob_fail_cache])
         if opportunities:
             logger.info(
-                "opportunities_found",
+                "scan_complete",
                 count=len(opportunities),
-                best_profit_cents=opportunities[0].net_profit_cents if opportunities else 0,
+                best_profit_cents=opportunities[0].net_profit_cents,
+                elapsed_sec=elapsed,
+                orderbooks_fetched=len(ob_keys) - skipped,
+                orderbooks_cached_skip=skipped,
             )
+        else:
+            logger.info("scan_complete", count=0, elapsed_sec=elapsed)
 
         return opportunities
-
-    async def _scan_match(self, match: MatchedMarket) -> list[ArbitrageOpportunity]:
-        """Check all platform pairs within a matched market for arb."""
-        opps: list[ArbitrageOpportunity] = []
-        platforms = list(match.markets.keys())
-
-        if len(platforms) < 2:
-            return opps
-
-        # Fetch orderbooks concurrently for all platforms in this match
-        orderbooks: dict[Platform, OrderBook] = {}
-        tasks = []
-        for platform in platforms:
-            market = match.markets[platform]
-            tasks.append(self._fetch_orderbook(platform, market.platform_market_id))
-
-        results = await asyncio.gather(*tasks)
-        for platform, ob in zip(platforms, results):
-            orderbooks[platform] = ob
-
-        # Check all pairs: buy YES on A + buy NO on B
-        for plat_a, plat_b in combinations(platforms, 2):
-            market_a = match.markets[plat_a]
-            market_b = match.markets[plat_b]
-            ob_a = orderbooks[plat_a]
-            ob_b = orderbooks[plat_b]
-
-            # Direction 1: YES on A + NO on B
-            opp = self._evaluate_pair(
-                match, plat_a, market_a, ob_a, "YES", plat_b, market_b, ob_b, "NO"
-            )
-            if opp:
-                opps.append(opp)
-
-            # Direction 2: NO on A + YES on B
-            opp = self._evaluate_pair(
-                match, plat_a, market_a, ob_a, "NO", plat_b, market_b, ob_b, "YES"
-            )
-            if opp:
-                opps.append(opp)
-
-        return opps
 
     def _evaluate_pair(
         self,
@@ -207,14 +231,15 @@ class OpportunityScanner:
 
     async def _fetch_orderbook(self, platform: Platform, market_id: str) -> OrderBook:
         try:
-            return await self.connector.get_orderbook(platform, market_id)
+            ob = await self.connector.get_orderbook(platform, market_id)
+            return ob
         except Exception as e:
-            logger.warning(
-                "orderbook_fetch_failed",
-                platform=platform.value,
-                market=market_id,
-                error=str(e),
-            )
+            err_str = str(e)
+            if "404" in err_str or "Not Found" in err_str:
+                self._ob_fail_cache.add((platform.value, market_id))
+                logger.debug("orderbook_cached_as_failed", platform=platform.value, market=market_id)
+            else:
+                logger.warning("orderbook_fetch_failed", platform=platform.value, market=market_id, error=err_str)
             return OrderBook()
 
     async def run_continuous(self, callback=None) -> None:

@@ -69,9 +69,11 @@ class KalshiConnector(BaseConnector):
             all_markets: list[NormalizedMarket] = []
             seen_ids: set[str] = set()
 
-            # Strategy 1: Fetch events and their sub-markets
-            # Events have clean titles ("Who will be next Pope?"), sub-markets are contracts
+            # Strategy 1: Fetch all events (sequential pages), then fetch
+            # per-event markets concurrently with a semaphore
             try:
+                # Phase A: collect all events
+                all_events: list[dict] = []
                 cursor = None
                 pages = 0
                 while pages < 5:
@@ -84,43 +86,59 @@ class KalshiConnector(BaseConnector):
                     events = data.get("events", [])
                     if not events:
                         break
+                    all_events.extend(events)
+                    cursor = data.get("cursor")
+                    if not cursor:
+                        break
+                    pages += 1
 
-                    for event in events:
-                        event_ticker = event.get("event_ticker", "")
-                        event_title = event.get("title", "")
-                        event_category = event.get("category", "")
-                        if not event_ticker:
-                            continue
+                # Phase B: fetch per-event markets in batches of 5 with delay
+                BATCH_SIZE = 5
 
-                        # Rate limit: small delay between event market requests
-                        await asyncio.sleep(0.2)
-
-                        # Fetch markets for this event
+                async def _fetch_event_markets(event: dict) -> list[dict]:
+                    event_ticker = event.get("event_ticker", "")
+                    if not event_ticker:
+                        return []
+                    for attempt in range(3):
                         try:
                             mresp = await self._client.get(
                                 "/trade-api/v2/markets",
                                 params={"event_ticker": event_ticker, "limit": 50, "status": "open"},
                             )
+                            if mresp.status_code == 429:
+                                await asyncio.sleep(1.0 * (attempt + 1))
+                                continue
                             mresp.raise_for_status()
-                            mdata = mresp.json()
-                            event_markets = mdata.get("markets", [])
-
-                            for m in event_markets:
-                                # Use event title as a prefix if market title is generic
-                                m["_event_title"] = event_title
-                                m["_event_category"] = event_category
-                                market = self._normalize_market(m)
-                                if market and market.platform_market_id not in seen_ids:
-                                    seen_ids.add(market.platform_market_id)
-                                    all_markets.append(market)
+                            result = []
+                            for m in mresp.json().get("markets", []):
+                                m["_event_title"] = event.get("title", "")
+                                m["_event_category"] = event.get("category", "")
+                                result.append(m)
+                            return result
                         except Exception:
-                            pass
+                            if attempt < 2:
+                                await asyncio.sleep(0.5)
+                            continue
+                    return []
 
-                    cursor = data.get("cursor")
-                    if not cursor:
-                        break
-                    pages += 1
-                    await asyncio.sleep(0.5)  # Rate limit between pages
+                # Process in batches: 5 concurrent, 0.3s between batches
+                all_raw: list[dict] = []
+                for i in range(0, len(all_events), BATCH_SIZE):
+                    batch = all_events[i:i + BATCH_SIZE]
+                    batch_results = await asyncio.gather(
+                        *[_fetch_event_markets(ev) for ev in batch]
+                    )
+                    for market_list in batch_results:
+                        all_raw.extend(market_list)
+                    if i + BATCH_SIZE < len(all_events):
+                        await asyncio.sleep(0.3)
+
+                for m in all_raw:
+                    market = self._normalize_market(m)
+                    if market and market.platform_market_id not in seen_ids:
+                        seen_ids.add(market.platform_market_id)
+                        all_markets.append(market)
+
             except Exception as e:
                 logger.warning("kalshi_events_fetch_failed", error=str(e))
 
@@ -286,16 +304,34 @@ class KalshiConnector(BaseConnector):
             return result
 
         # Kalshi v2 orderbook: {"yes": [[price, qty], ...], "no": [[price, qty], ...]}
-        yes_raw = data.get("yes")
-        no_raw = data.get("no")
+        # "yes" = bids to BUY yes, "no" = bids to BUY no
+        # A NO bid at price P is equivalent to a YES ask at (100 - P) and vice versa.
+        yes_bids_raw = data.get("yes")
+        no_bids_raw = data.get("no")
 
-        # Handle both list format and dict format
-        if isinstance(yes_raw, dict):
-            yes_raw = yes_raw.get("asks", [])
-        if isinstance(no_raw, dict):
-            no_raw = no_raw.get("asks", [])
+        if isinstance(yes_bids_raw, dict):
+            yes_bids_raw = yes_bids_raw.get("asks", [])
+        if isinstance(no_bids_raw, dict):
+            no_bids_raw = no_bids_raw.get("asks", [])
+
+        yes_bids = parse_levels(yes_bids_raw)
+        no_bids = parse_levels(no_bids_raw)
+
+        # Derive asks from the complement side's bids
+        yes_asks = [
+            OrderBookLevel(price_cents=100 - b.price_cents, quantity=b.quantity)
+            for b in no_bids
+            if 1 <= 100 - b.price_cents <= 99
+        ]
+        no_asks = [
+            OrderBookLevel(price_cents=100 - b.price_cents, quantity=b.quantity)
+            for b in yes_bids
+            if 1 <= 100 - b.price_cents <= 99
+        ]
 
         return OrderBook(
-            yes_asks=parse_levels(yes_raw),
-            no_asks=parse_levels(no_raw),
+            yes_asks=yes_asks,
+            yes_bids=yes_bids,
+            no_asks=no_asks,
+            no_bids=no_bids,
         )
