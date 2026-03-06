@@ -13,8 +13,8 @@ from models.market import MatchedMarket, NormalizedMarket, Platform
 
 logger = structlog.get_logger()
 
-# TF-IDF threshold: 0.85 = titles must be nearly identical
-MIN_TFIDF_SIMILARITY = 0.85
+# TF-IDF threshold: 0.80 = titles must be very similar
+MIN_TFIDF_SIMILARITY = 0.80
 
 # Stop words to remove for normalized exact matching
 _STOP_WORDS = frozenset({
