@@ -73,9 +73,9 @@ class OpportunityScanner:
         """Run a single scan cycle across all matched markets."""
         t0 = time.monotonic()
 
-        # Phase 1: sort matches by score (exact matches first), take top 500
+        # Phase 1: sort matches by score (exact matches first), take top 300
         sorted_matches = sorted(self.active_matches, key=lambda m: m.match_score, reverse=True)
-        top_matches = [m for m in sorted_matches if len(m.markets) >= 2][:500]
+        top_matches = [m for m in sorted_matches if len(m.markets) >= 2][:300]
 
         # Phase 1b: collect unique orderbook IDs
         ob_keys: list[tuple[Platform, str]] = []
