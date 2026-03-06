@@ -25,7 +25,7 @@ class MarketStatus(str, Enum):
 
 
 class OrderBookLevel(BaseModel):
-    price_cents: int = Field(..., ge=1, le=99, description="Price in cents (1-99)")
+    price_cents: float = Field(..., gt=0, lt=100, description="Price in cents")
     quantity: int = Field(..., ge=0, description="Available contracts")
 
 
@@ -50,11 +50,11 @@ class NormalizedMarket(BaseModel):
     direction: str = Field(default="", description="above/below/exact")
     event_date: datetime | None = Field(default=None, description="Resolution date")
 
-    # Pricing
-    yes_ask_cents: int | None = Field(default=None, description="Best YES ask price")
-    yes_bid_cents: int | None = Field(default=None, description="Best YES bid price")
-    no_ask_cents: int | None = Field(default=None, description="Best NO ask price")
-    no_bid_cents: int | None = Field(default=None, description="Best NO bid price")
+    # Pricing (cents with decimal precision, e.g. 2.9, 93.2)
+    yes_ask_cents: float | None = Field(default=None, description="Best YES ask price")
+    yes_bid_cents: float | None = Field(default=None, description="Best YES bid price")
+    no_ask_cents: float | None = Field(default=None, description="Best NO ask price")
+    no_bid_cents: float | None = Field(default=None, description="Best NO bid price")
 
     orderbook: OrderBook | None = Field(default=None, description="Full orderbook")
 

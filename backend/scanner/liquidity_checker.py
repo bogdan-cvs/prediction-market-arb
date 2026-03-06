@@ -3,7 +3,7 @@ from __future__ import annotations
 from models.market import OrderBook, OrderBookLevel
 
 
-def get_best_ask(orderbook: OrderBook, outcome: str) -> int | None:
+def get_best_ask(orderbook: OrderBook, outcome: str) -> float | None:
     """Get the best (lowest) ask price for an outcome in cents."""
     if outcome.upper() == "YES":
         asks = orderbook.yes_asks
@@ -16,7 +16,7 @@ def get_best_ask(orderbook: OrderBook, outcome: str) -> int | None:
     return min(a.price_cents for a in asks)
 
 
-def get_best_bid(orderbook: OrderBook, outcome: str) -> int | None:
+def get_best_bid(orderbook: OrderBook, outcome: str) -> float | None:
     """Get the best (highest) bid price for an outcome in cents."""
     if outcome.upper() == "YES":
         bids = orderbook.yes_bids
@@ -30,7 +30,7 @@ def get_best_bid(orderbook: OrderBook, outcome: str) -> int | None:
 
 
 def get_available_quantity(
-    orderbook: OrderBook, outcome: str, at_price_cents: int
+    orderbook: OrderBook, outcome: str, at_price_cents: float
 ) -> int:
     """Get total available quantity at or better than the given price.
 
@@ -51,7 +51,7 @@ def get_available_quantity(
 
 def get_effective_price(
     orderbook: OrderBook, outcome: str, quantity: int
-) -> int | None:
+) -> float | None:
     """Get volume-weighted average price to fill `quantity` contracts.
 
     Returns price in cents, or None if insufficient liquidity.
@@ -62,7 +62,7 @@ def get_effective_price(
         asks = sorted(orderbook.no_asks, key=lambda x: x.price_cents)
 
     remaining = quantity
-    total_cost = 0
+    total_cost = 0.0
 
     for level in asks:
         fill = min(remaining, level.quantity)
@@ -74,7 +74,7 @@ def get_effective_price(
     if remaining > 0:
         return None  # Insufficient liquidity
 
-    return total_cost // quantity  # Average price in cents
+    return round(total_cost / quantity, 1)
 
 
 def assess_liquidity(
@@ -87,7 +87,7 @@ def assess_liquidity(
     ) if best_ask else 0
     effective_price = get_effective_price(orderbook, outcome, desired_qty)
 
-    slippage_cents = 0
+    slippage_cents = 0.0
     if best_ask and effective_price:
         slippage_cents = effective_price - best_ask
 

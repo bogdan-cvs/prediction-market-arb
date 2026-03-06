@@ -46,9 +46,8 @@ class OpportunityScanner:
         self.active_matches = find_matches(markets_by_platform)
         t_match = time.monotonic() - t1
 
-        # Save to cache
-        for match in self.active_matches:
-            await self.match_cache.save_match(match)
+        # Save to cache in batch
+        await self.match_cache.save_matches_batch(self.active_matches)
 
         logger.info(
             "matches_refreshed",
@@ -73,10 +72,15 @@ class OpportunityScanner:
     async def scan_once(self) -> list[ArbitrageOpportunity]:
         """Run a single scan cycle across all matched markets."""
         t0 = time.monotonic()
-        # Phase 1: collect all unique (platform, orderbook_id) pairs we need orderbooks for
+
+        # Phase 1: sort matches by score (exact matches first), take top 200
+        sorted_matches = sorted(self.active_matches, key=lambda m: m.match_score, reverse=True)
+        top_matches = [m for m in sorted_matches if len(m.markets) >= 2][:200]
+
+        # Phase 1b: collect unique orderbook IDs
         ob_keys: list[tuple[Platform, str]] = []
         seen_ob: set[tuple[str, str]] = set()
-        for match in self.active_matches:
+        for match in top_matches:
             for platform, market in match.markets.items():
                 ob_id = self._orderbook_id(market)
                 key = (platform.value, ob_id)
@@ -84,8 +88,10 @@ class OpportunityScanner:
                     seen_ob.add(key)
                     ob_keys.append((platform, ob_id))
 
-        # Phase 2: fetch ALL orderbooks concurrently (semaphore = 20)
-        sem = asyncio.Semaphore(20)
+        logger.info("scan_phase1", total_matches=len(self.active_matches), scanning=len(top_matches), orderbooks_needed=len(ob_keys))
+
+        # Phase 2: fetch orderbooks concurrently (semaphore = 10 to balance speed vs rate limits)
+        sem = asyncio.Semaphore(10)
 
         async def _fetch_ob(plat: Platform, mid: str) -> tuple[str, str, OrderBook]:
             cache_key = (plat.value, mid)
@@ -99,9 +105,9 @@ class OpportunityScanner:
         for pval, mid, ob in results:
             ob_map[(pval, mid)] = ob
 
-        # Phase 3: evaluate all matches using pre-fetched orderbooks
+        # Phase 3: evaluate top matches using pre-fetched orderbooks
         opportunities: list[ArbitrageOpportunity] = []
-        for match in self.active_matches:
+        for match in top_matches:
             platforms = list(match.markets.keys())
             if len(platforms) < 2:
                 continue
@@ -166,22 +172,22 @@ class OpportunityScanner:
         if price_a is None or price_b is None:
             return None
 
-        # Prices must be valid (1-99 cents range)
-        if price_a < 1 or price_a > 99 or price_b < 1 or price_b > 99:
+        # Prices must be valid (0.1-99.9 cents range)
+        if price_a < 0.1 or price_a > 99.9 or price_b < 0.1 or price_b > 99.9:
             return None
 
-        total_cost = price_a + price_b
+        total_cost = round(price_a + price_b, 1)
         if total_cost >= 100:
             return None  # No arbitrage
 
-        gross_profit = 100 - total_cost
+        gross_profit = round(100 - total_cost, 1)
 
         # Calculate fees
         qty = settings.min_quantity
         fees_total = total_fees_for_arb(plat_a, price_a, plat_b, price_b, qty)
-        fees_per_contract = fees_total // qty if qty > 0 else 0
+        fees_per_contract = round(fees_total / qty, 1) if qty > 0 else 0
 
-        net_profit = gross_profit - fees_per_contract
+        net_profit = round(gross_profit - fees_per_contract, 1)
         if net_profit < settings.min_profit_cents:
             return None
 

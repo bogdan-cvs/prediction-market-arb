@@ -1,20 +1,27 @@
 from __future__ import annotations
 
+import re
+import time
 import uuid
-from datetime import datetime
-from itertools import combinations
-from typing import Any
+from collections import defaultdict
 
 import structlog
-from rapidfuzz import fuzz
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sparse_dot_topn import sp_matmul_topn
 
-from matching.market_normalizer import extract_entities
 from models.market import MatchedMarket, NormalizedMarket, Platform
 
 logger = structlog.get_logger()
 
-# Minimum similarity score (0-100) for fuzzy match fallback
-MIN_FUZZY_SCORE = 75.0
+# TF-IDF threshold: 0.85 = titles must be nearly identical
+MIN_TFIDF_SIMILARITY = 0.85
+
+# Stop words to remove for normalized exact matching
+_STOP_WORDS = frozenset({
+    "will", "be", "the", "a", "an", "in", "on", "at", "to", "of", "for",
+    "by", "is", "are", "was", "were", "do", "does", "did", "has", "have",
+    "before", "after", "during", "from", "than", "or", "and",
+})
 
 
 def find_matches(
@@ -22,260 +29,190 @@ def find_matches(
 ) -> list[MatchedMarket]:
     """Find matching markets across platforms.
 
-    Strategy:
-    1. Extract entities (asset, date, threshold, direction) from each market
-    2. Exact match on (asset + date + threshold) for structured markets
-    3. High fuzzy text similarity for unstructured markets (politics, entertainment)
+    Layer 1: Exact match on normalized titles (instant, 100% correct).
+    Layer 2: TF-IDF cosine similarity at threshold 0.85 (fast, high precision).
     """
-    # Build entity index per market
-    indexed: list[tuple[NormalizedMarket, dict[str, Any]]] = []
-    for platform, markets in markets_by_platform.items():
-        for market in markets:
-            entities = extract_entities(market.title)
-            # Also try ticker
-            if not entities["asset"] and market.ticker:
-                ticker_entities = extract_entities(market.ticker)
-                if ticker_entities["asset"]:
-                    entities["asset"] = ticker_entities["asset"]
-                if not entities["date"] and ticker_entities["date"]:
-                    entities["date"] = ticker_entities["date"]
-                if not entities["threshold"] and ticker_entities["threshold"]:
-                    entities["threshold"] = ticker_entities["threshold"]
-
-            indexed.append((market, entities))
-
-    # Group by entity key for exact matching
-    entity_groups: dict[str, list[tuple[NormalizedMarket, dict[str, Any]]]] = {}
-
-    for market, entities in indexed:
-        key = _entity_key(entities)
-        if key:
-            entity_groups.setdefault(key, []).append((market, entities))
-
     matches: list[MatchedMarket] = []
+    matched_ids: set[tuple[str, str]] = set()
 
-    # Phase 1: Exact entity matches
-    for key, group in entity_groups.items():
-        platforms_in_group: dict[Platform, NormalizedMarket] = {}
-        for market, _ in group:
-            if market.platform not in platforms_in_group:
-                platforms_in_group[market.platform] = market
-
-        if len(platforms_in_group) >= 2:
-            match = MatchedMarket(
-                match_id=str(uuid.uuid4())[:12],
-                markets=platforms_in_group,
-                match_score=1.0,
-                verified=False,
-            )
-            matches.append(match)
-            logger.debug(
-                "exact_match_found",
-                key=key,
-                platforms=[p.value for p in platforms_in_group],
-            )
-
-    # Phase 2: Fuzzy matching — only cross-platform pairs
-    matched_ids = set()
-    for m in matches:
-        for market in m.markets.values():
-            matched_ids.add((market.platform, market.platform_market_id))
-
-    # Group remaining by platform for efficient cross-platform comparison
-    by_platform: dict[Platform, list[tuple[NormalizedMarket, dict[str, Any]]]] = {}
-    for market, entities in indexed:
-        if (market.platform, market.platform_market_id) not in matched_ids:
-            by_platform.setdefault(market.platform, []).append((market, entities))
+    by_platform: dict[Platform, list[NormalizedMarket]] = {}
+    for platform, markets in markets_by_platform.items():
+        by_platform[platform] = markets
 
     platform_list = list(by_platform.keys())
-
-    # Compare each platform pair (not within same platform)
     for pi in range(len(platform_list)):
         for pj in range(pi + 1, len(platform_list)):
-            plat_a = platform_list[pi]
-            plat_b = platform_list[pj]
+            plat_a, plat_b = platform_list[pi], platform_list[pj]
             group_a = by_platform[plat_a]
             group_b = by_platform[plat_b]
 
-            # Use rapidfuzz batch extraction for speed: for each market in A,
-            # find best match in B using cleaned titles
-            from rapidfuzz import process as rfprocess
+            # Layer 1: exact normalized title match
+            exact = _exact_match(group_a, group_b, matched_ids)
+            matches.extend(exact)
+            for m in exact:
+                for market in m.markets.values():
+                    matched_ids.add((market.platform.value, market.platform_market_id))
 
-            # Build lookup for B
-            b_titles = [_clean_for_comparison(m.title) for m, _ in group_b]
-            b_lookup = list(range(len(group_b)))
-
-            for idx_a, (market_a, ent_a) in enumerate(group_a):
-                if (market_a.platform, market_a.platform_market_id) in matched_ids:
-                    continue
-
-                clean_a = _clean_for_comparison(market_a.title)
-                # Use rapidfuzz extractBests for batch comparison
-                results = rfprocess.extract(
-                    clean_a, b_titles, scorer=fuzz.token_sort_ratio,
-                    score_cutoff=MIN_FUZZY_SCORE - 5, limit=3,
-                )
-
-                for title_b, raw_score, idx_b in results:
-                    market_b, ent_b = group_b[idx_b]
-                    if (market_b.platform, market_b.platform_market_id) in matched_ids:
-                        continue
-
-                    # Re-score with full logic (handles entity matching, length guards)
-                    score = _fuzzy_score(market_a, ent_a, market_b, ent_b)
-                    if score >= MIN_FUZZY_SCORE:
-                        match = MatchedMarket(
-                            match_id=str(uuid.uuid4())[:12],
-                            markets={
-                                market_a.platform: market_a,
-                                market_b.platform: market_b,
-                            },
-                            match_score=score / 100.0,
-                            verified=False,
-                        )
-                        matches.append(match)
-                        matched_ids.add((market_a.platform, market_a.platform_market_id))
-                        matched_ids.add((market_b.platform, market_b.platform_market_id))
-                        logger.debug(
-                            "fuzzy_match_found",
-                            score=score,
-                            a=market_a.title[:60],
-                            b=market_b.title[:60],
-                        )
-                        break  # Market A matched, move to next
+            # Layer 2: TF-IDF fuzzy match on remaining
+            fuzzy = _tfidf_match(group_a, group_b, matched_ids)
+            matches.extend(fuzzy)
+            for m in fuzzy:
+                for market in m.markets.values():
+                    matched_ids.add((market.platform.value, market.platform_market_id))
 
     logger.info("matching_complete", total_matches=len(matches))
     return matches
 
 
-def _entity_key(entities: dict[str, Any]) -> str:
-    """Create a match key from extracted entities."""
-    asset = entities.get("asset", "")
-    threshold = entities.get("threshold")
-    date = entities.get("date")
-
-    if not asset:
-        return ""
-
-    parts = [asset]
-    if threshold is not None:
-        parts.append(str(int(threshold)))
-    if date is not None:
-        parts.append(date.strftime("%Y%m%d"))
-
-    # Need at least asset + one more component to make a useful key
-    if len(parts) < 2:
-        return ""
-
-    return "|".join(parts)
-
-
-def _fuzzy_score(
-    market_a: NormalizedMarket,
-    ent_a: dict[str, Any],
-    market_b: NormalizedMarket,
-    ent_b: dict[str, Any],
-) -> float:
-    """Compute similarity score between two markets.
-
-    For structured markets (crypto prices): uses entity matching.
-    For unstructured markets (politics, entertainment): uses text similarity.
-    """
-    has_asset_a = bool(ent_a.get("asset"))
-    has_asset_b = bool(ent_b.get("asset"))
-
-    # If both have assets, use structured matching
-    if has_asset_a and has_asset_b:
-        return _structured_score(market_a, ent_a, market_b, ent_b)
-
-    # If one has an asset and the other doesn't, unlikely match
-    if has_asset_a != has_asset_b:
-        # Still allow if text similarity is very high
-        text_score = _text_similarity(market_a.title, market_b.title)
-        return text_score if text_score >= 85.0 else 0.0
-
-    # Neither has an asset — use pure text similarity (politics, entertainment, etc.)
-    return _text_similarity(market_a.title, market_b.title)
-
-
-def _structured_score(
-    market_a: NormalizedMarket,
-    ent_a: dict[str, Any],
-    market_b: NormalizedMarket,
-    ent_b: dict[str, Any],
-) -> float:
-    """Score for structured markets (crypto, financial)."""
-    score = 0.0
-
-    if ent_a["asset"] != ent_b["asset"]:
-        return 0.0  # Different assets = no match
-    score += 40.0
-
-    # Threshold match
-    if ent_a["threshold"] is not None and ent_b["threshold"] is not None:
-        if ent_a["threshold"] == ent_b["threshold"]:
-            score += 30.0
-        else:
-            max_val = max(ent_a["threshold"], ent_b["threshold"])
-            if max_val > 0:
-                ratio = min(ent_a["threshold"], ent_b["threshold"]) / max_val
-                if ratio > 0.99:
-                    score += 20.0
-                else:
-                    return score  # Different thresholds
-
-    # Date match
-    if ent_a["date"] and ent_b["date"]:
-        if ent_a["date"].date() == ent_b["date"].date():
-            score += 20.0
-        else:
-            return score  # Different dates
-
-    # Direction match
-    if ent_a["direction"] and ent_b["direction"]:
-        if ent_a["direction"] == ent_b["direction"]:
-            score += 10.0
-
-    # Text similarity bonus
-    text_score = _text_similarity(market_a.title, market_b.title)
-    score += text_score * 0.1
-
-    return min(score, 100.0)
-
-
-def _text_similarity(title_a: str, title_b: str) -> float:
-    """Compute text similarity between two market titles."""
-    clean_a = _clean_for_comparison(title_a)
-    clean_b = _clean_for_comparison(title_b)
-
-    # Use token_sort_ratio as primary (order-independent full comparison)
-    sort_score = fuzz.token_sort_ratio(clean_a, clean_b)
-
-    # token_set_ratio is too aggressive (subset matching) — only use if
-    # lengths are similar (within 2x) to avoid "GTA VI" matching everything
-    set_score = 0.0
-    len_a, len_b = len(clean_a), len(clean_b)
-    if len_a > 0 and len_b > 0:
-        length_ratio = min(len_a, len_b) / max(len_a, len_b)
-        if length_ratio > 0.4:
-            set_score = fuzz.token_set_ratio(clean_a, clean_b) * length_ratio
-
-    return max(sort_score, set_score)
-
-
-def _clean_for_comparison(text: str) -> str:
-    """Clean a market title for fuzzy comparison."""
-    import re
+def _normalize_title(text: str) -> str:
+    """Normalize a title for exact matching: lowercase, strip punctuation,
+    remove stop words, collapse whitespace."""
     text = text.lower().strip()
-    # Remove punctuation
-    text = re.sub(r"[?!.,;:\"'()\[\]{}]", " ", text)
-    # Remove common noise words
-    noise = {
-        "will", "be", "the", "on", "at", "or", "by", "end", "of",
-        "close", "closing", "price", "market", "contract", "a", "an",
-        "in", "to", "for", "and", "is", "are", "was", "were", "this",
-        "that", "what", "which", "who", "whom", "when", "where", "how",
-    }
+    text = re.sub(r"[?!.,;:\"'()\[\]{}\-/]", " ", text)
     words = text.split()
-    words = [w for w in words if w not in noise]
+    words = [w for w in words if w not in _STOP_WORDS]
     return " ".join(words)
+
+
+def _exact_match(
+    group_a: list[NormalizedMarket],
+    group_b: list[NormalizedMarket],
+    matched_ids: set[tuple[str, str]],
+) -> list[MatchedMarket]:
+    """Layer 1: exact match on normalized titles."""
+    if not group_a or not group_b:
+        return []
+
+    t0 = time.monotonic()
+
+    # Build index for group_b
+    b_index: dict[str, list[NormalizedMarket]] = defaultdict(list)
+    for m in group_b:
+        key = (m.platform.value, m.platform_market_id)
+        if key not in matched_ids:
+            norm = _normalize_title(m.title)
+            if norm:
+                b_index[norm].append(m)
+
+    matches: list[MatchedMarket] = []
+    for market_a in group_a:
+        key_a = (market_a.platform.value, market_a.platform_market_id)
+        if key_a in matched_ids:
+            continue
+
+        norm_a = _normalize_title(market_a.title)
+        if not norm_a or norm_a not in b_index:
+            continue
+
+        # Take first unmatched from b_index
+        for market_b in b_index[norm_a]:
+            key_b = (market_b.platform.value, market_b.platform_market_id)
+            if key_b in matched_ids:
+                continue
+
+            matched_ids.add(key_a)
+            matched_ids.add(key_b)
+            matches.append(MatchedMarket(
+                match_id=str(uuid.uuid4())[:12],
+                markets={market_a.platform: market_a, market_b.platform: market_b},
+                match_score=1.0,
+                verified=True,
+            ))
+            break
+
+    elapsed = round(time.monotonic() - t0, 2)
+    logger.info("exact_match_done", matches=len(matches), sec=elapsed)
+    return matches
+
+
+def _tfidf_match(
+    group_a: list[NormalizedMarket],
+    group_b: list[NormalizedMarket],
+    matched_ids: set[tuple[str, str]],
+) -> list[MatchedMarket]:
+    """Layer 2: TF-IDF cosine similarity matching at high threshold."""
+    # Filter out already-matched markets
+    filtered_a = [m for m in group_a
+                  if (m.platform.value, m.platform_market_id) not in matched_ids]
+    filtered_b = [m for m in group_b
+                  if (m.platform.value, m.platform_market_id) not in matched_ids]
+
+    if not filtered_a or not filtered_b:
+        return []
+
+    t0 = time.monotonic()
+    logger.info("tfidf_match_start", group_a=len(filtered_a), group_b=len(filtered_b))
+
+    titles_a = [_clean_for_tfidf(m.title) for m in filtered_a]
+    titles_b = [_clean_for_tfidf(m.title) for m in filtered_b]
+
+    vectorizer = TfidfVectorizer(
+        analyzer="word",
+        ngram_range=(1, 2),
+        min_df=2,
+        max_df=0.5,
+        sublinear_tf=True,
+    )
+    all_titles = titles_a + titles_b
+    tfidf_matrix = vectorizer.fit_transform(all_titles)
+
+    matrix_a = tfidf_matrix[:len(titles_a)]
+    matrix_b = tfidf_matrix[len(titles_a):]
+
+    sim_sparse = sp_matmul_topn(
+        matrix_a, matrix_b.T,
+        top_n=3,
+        threshold=MIN_TFIDF_SIMILARITY,
+        sort=True,
+    )
+
+    t1 = time.monotonic()
+    logger.info("tfidf_sparse_done", nnz=sim_sparse.nnz, sec=round(t1 - t0, 2))
+
+    matches: list[MatchedMarket] = []
+    used_b: set[int] = set()
+
+    coo = sim_sparse.tocoo()
+    row_matches: dict[int, list[tuple[int, float]]] = defaultdict(list)
+    for r, c, v in zip(coo.row, coo.col, coo.data):
+        row_matches[int(r)].append((int(c), float(v)))
+
+    for idx_a in row_matches:
+        row_matches[idx_a].sort(key=lambda x: -x[1])
+
+    sorted_rows = sorted(row_matches.keys(), key=lambda i: -row_matches[i][0][1])
+
+    for idx_a in sorted_rows:
+        market_a = filtered_a[idx_a]
+        if (market_a.platform.value, market_a.platform_market_id) in matched_ids:
+            continue
+
+        for idx_b, score in row_matches[idx_a]:
+            if idx_b in used_b:
+                continue
+            market_b = filtered_b[idx_b]
+            if (market_b.platform.value, market_b.platform_market_id) in matched_ids:
+                continue
+
+            used_b.add(idx_b)
+            matched_ids.add((market_a.platform.value, market_a.platform_market_id))
+            matched_ids.add((market_b.platform.value, market_b.platform_market_id))
+            matches.append(MatchedMarket(
+                match_id=str(uuid.uuid4())[:12],
+                markets={market_a.platform: market_a, market_b.platform: market_b},
+                match_score=min(score, 1.0),
+                verified=False,
+            ))
+            break
+
+    elapsed = round(time.monotonic() - t0, 2)
+    logger.info("tfidf_match_done", matches=len(matches), sec=elapsed)
+    return matches
+
+
+def _clean_for_tfidf(text: str) -> str:
+    """Clean a market title for TF-IDF vectorization."""
+    text = text.lower().strip()
+    text = re.sub(r"[?!.,;:\"'()\[\]{}]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()

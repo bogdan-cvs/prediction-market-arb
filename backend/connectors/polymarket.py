@@ -56,13 +56,14 @@ class PolymarketConnector(BaseConnector):
         if not self._gamma_client:
             return []
         try:
+            seen: set[str] = set()
             markets: list[NormalizedMarket] = []
 
-            # Fetch multiple pages of events for broader coverage
-            for offset in range(0, 200, 50):
+            # Fetch events with nested markets (10 pages x 100 events)
+            for offset in range(0, 10000, 100):
                 try:
                     params: dict[str, Any] = {
-                        "limit": 50,
+                        "limit": 100,
                         "offset": offset,
                         "active": "true",
                         "closed": "false",
@@ -76,36 +77,16 @@ class PolymarketConnector(BaseConnector):
                         for m in event.get("markets", []):
                             if not m.get("active") or m.get("closed"):
                                 continue
-                            normalized = self._normalize_market(m)
-                            markets.extend(normalized)
+                            for normalized in self._normalize_market(m):
+                                if normalized.platform_market_id not in seen:
+                                    seen.add(normalized.platform_market_id)
+                                    markets.append(normalized)
                 except Exception as e:
                     logger.warning("polymarket_events_page_failed", offset=offset, error=str(e))
                     break
 
-            # Also fetch direct markets endpoint for broader coverage
-            try:
-                resp2 = await self._gamma_client.get("/markets", params={
-                    "limit": 100,
-                    "active": "true",
-                    "closed": "false",
-                })
-                resp2.raise_for_status()
-                for m in resp2.json():
-                    normalized = self._normalize_market(m)
-                    markets.extend(normalized)
-            except Exception as e:
-                logger.warning("polymarket_markets_fetch_failed", error=str(e))
-
-            # Deduplicate by market_id
-            seen: set[str] = set()
-            unique: list[NormalizedMarket] = []
-            for m in markets:
-                if m.platform_market_id not in seen:
-                    seen.add(m.platform_market_id)
-                    unique.append(m)
-
-            logger.info("polymarket_markets_fetched", count=len(unique))
-            return unique
+            logger.info("polymarket_markets_fetched", count=len(markets))
+            return markets
         except Exception as e:
             logger.error("polymarket_get_markets_failed", error=str(e))
             return []
@@ -243,9 +224,9 @@ class PolymarketConnector(BaseConnector):
                         outcome_prices = _json.loads(outcome_prices)
                     prices = [float(p) for p in outcome_prices if p]
                     if len(prices) >= 1:
-                        yes_price = int(prices[0] * 100)
+                        yes_price = round(prices[0] * 100, 1)
                     if len(prices) >= 2:
-                        no_price = int(prices[1] * 100)
+                        no_price = round(prices[1] * 100, 1)
                 except (ValueError, TypeError):
                     pass
 
@@ -279,9 +260,9 @@ class PolymarketConnector(BaseConnector):
             for lv in levels:
                 price = lv.get("price", "0")
                 size = lv.get("size", "0")
-                price_cents = int(float(price) * 100)
+                price_cents = round(float(price) * 100, 1)
                 qty = int(float(size))
-                if 1 <= price_cents <= 99 and qty > 0:
+                if 0 < price_cents < 100 and qty > 0:
                     result.append(OrderBookLevel(price_cents=price_cents, quantity=qty))
             return result
 
@@ -293,11 +274,13 @@ class PolymarketConnector(BaseConnector):
             yes_bids=bids,
             # Polymarket orderbook is per-token; NO is complement
             no_asks=[
-                OrderBookLevel(price_cents=100 - b.price_cents, quantity=b.quantity)
+                OrderBookLevel(price_cents=round(100 - b.price_cents, 1), quantity=b.quantity)
                 for b in bids
+                if 0 < 100 - b.price_cents < 100
             ],
             no_bids=[
-                OrderBookLevel(price_cents=100 - a.price_cents, quantity=a.quantity)
+                OrderBookLevel(price_cents=round(100 - a.price_cents, 1), quantity=a.quantity)
                 for a in asks
+                if 0 < 100 - a.price_cents < 100
             ],
         )

@@ -5,10 +5,10 @@ from models.market import Platform
 
 def calculate_fee_cents(
     platform: Platform,
-    price_cents: int,
+    price_cents: float,
     quantity: int,
     side: str = "YES",
-) -> int:
+) -> float:
     """Calculate estimated fee in cents for a trade.
 
     Returns total fee for the given quantity.
@@ -24,55 +24,38 @@ def calculate_fee_cents(
     return 0
 
 
-def _kalshi_fee(price_cents: int, quantity: int) -> int:
-    """Kalshi: up to ~0.7% of expected profit per contract, capped at ~$0.085/contract.
-
-    Fee applies to the expected earnings (winning - cost).
-    Simplified: ~0.7 cents per contract on average for typical arb prices.
-    Cap: 8.5 cents per contract (if really profitable).
-    """
-    # Expected profit per contract if this side wins
-    expected_profit = 100 - price_cents  # cents
-    # Fee rate ~7% of expected profit
-    fee_per_contract = min(int(expected_profit * 0.07), 8)
-    return fee_per_contract * quantity
-
-
-def _polymarket_fee(price_cents: int, quantity: int) -> int:
-    """Polymarket: 0% maker, ~2% of winnings for takers.
-
-    For arb we're likely taking. Fee on expected earnings.
-    """
+def _kalshi_fee(price_cents: float, quantity: int) -> float:
+    """Kalshi: ~7% of expected profit, capped at 8.5c/contract."""
     expected_profit = 100 - price_cents
-    fee_per_contract = int(expected_profit * 0.02)
+    fee_per_contract = min(round(expected_profit * 0.07, 1), 8.5)
     return fee_per_contract * quantity
 
 
-def _limitless_fee(price_cents: int, quantity: int) -> int:
-    """Limitless: taker fee on orderbook trades.
-
-    Estimated ~1-2% taker fee. Maker rebates available but we assume taker.
-    """
-    fee_per_contract = max(1, int(price_cents * 0.015))
+def _polymarket_fee(price_cents: float, quantity: int) -> float:
+    """Polymarket: ~2% of winnings for takers."""
+    expected_profit = 100 - price_cents
+    fee_per_contract = round(expected_profit * 0.02, 1)
     return fee_per_contract * quantity
 
 
-def _ibkr_fee(price_cents: int, quantity: int) -> int:
-    """IBKR/ForecastEx: zero commission.
+def _limitless_fee(price_cents: float, quantity: int) -> float:
+    """Limitless: ~1.5% taker fee."""
+    fee_per_contract = max(0.1, round(price_cents * 0.015, 1))
+    return fee_per_contract * quantity
 
-    But the spread (YES + NO = $1.01) means there's an implicit cost.
-    We don't count the spread as a fee here; it's reflected in the price.
-    """
+
+def _ibkr_fee(price_cents: float, quantity: int) -> float:
+    """IBKR/ForecastEx: zero commission."""
     return 0
 
 
 def total_fees_for_arb(
     platform_a: Platform,
-    price_a_cents: int,
+    price_a_cents: float,
     platform_b: Platform,
-    price_b_cents: int,
+    price_b_cents: float,
     quantity: int,
-) -> int:
+) -> float:
     """Total fees for an arbitrage pair trade."""
     fee_a = calculate_fee_cents(platform_a, price_a_cents, quantity)
     fee_b = calculate_fee_cents(platform_b, price_b_cents, quantity)

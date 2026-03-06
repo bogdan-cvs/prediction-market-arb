@@ -19,41 +19,37 @@ class MatchCache:
         self.db_path = db_path or settings.db_path
 
     async def save_match(self, match: MatchedMarket) -> None:
+        await self.save_matches_batch([match])
+
+    async def save_matches_batch(self, matches: list[MatchedMarket]) -> None:
+        if not matches:
+            return
         async with aiosqlite.connect(self.db_path) as db:
-            kalshi_id = ""
-            poly_id = ""
-            limitless_id = ""
-            ibkr_id = ""
-
-            for platform, market in match.markets.items():
-                if platform == Platform.KALSHI:
-                    kalshi_id = market.platform_market_id
-                elif platform == Platform.POLYMARKET:
-                    poly_id = market.platform_market_id
-                elif platform == Platform.LIMITLESS:
-                    limitless_id = market.platform_market_id
-                elif platform == Platform.IBKR:
-                    ibkr_id = market.platform_market_id
-
-            await db.execute(
-                """
-                INSERT OR REPLACE INTO match_cache
+            rows = []
+            for match in matches:
+                kalshi_id = poly_id = limitless_id = ibkr_id = ""
+                for platform, market in match.markets.items():
+                    if platform == Platform.KALSHI:
+                        kalshi_id = market.platform_market_id
+                    elif platform == Platform.POLYMARKET:
+                        poly_id = market.platform_market_id
+                    elif platform == Platform.LIMITLESS:
+                        limitless_id = market.platform_market_id
+                    elif platform == Platform.IBKR:
+                        ibkr_id = market.platform_market_id
+                rows.append((
+                    match.match_id, kalshi_id, poly_id, limitless_id,
+                    ibkr_id, match.match_score, 1 if match.verified else 0,
+                ))
+            await db.executemany(
+                """INSERT OR REPLACE INTO match_cache
                 (match_id, kalshi_ticker, polymarket_market_id, limitless_market_id,
                  ibkr_con_id, match_score, verified, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                """,
-                (
-                    match.match_id,
-                    kalshi_id,
-                    poly_id,
-                    limitless_id,
-                    ibkr_id,
-                    match.match_score,
-                    1 if match.verified else 0,
-                ),
+                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+                rows,
             )
             await db.commit()
-            logger.debug("match_saved", match_id=match.match_id)
+            logger.info("matches_saved_batch", count=len(matches))
 
     async def get_verified_matches(self) -> list[dict[str, Any]]:
         async with aiosqlite.connect(self.db_path) as db:

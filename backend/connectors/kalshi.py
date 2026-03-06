@@ -74,7 +74,7 @@ class KalshiConnector(BaseConnector):
             # with ~10 paginated calls in ~4s.
             cursor = None
             pages = 0
-            while pages < 5:
+            while pages < 50:
                 params: dict[str, Any] = {
                     "limit": 200,
                     "status": "open",
@@ -138,17 +138,28 @@ class KalshiConnector(BaseConnector):
     async def get_orderbook(self, market_id: str) -> OrderBook:
         if not self._client:
             return OrderBook()
-        try:
-            resp = await self._client.get(
-                f"/trade-api/v2/markets/{market_id}/orderbook",
-                params={"depth": 10},
-            )
-            resp.raise_for_status()
-            data = resp.json().get("orderbook", {})
-            return self._parse_orderbook(data)
-        except Exception as e:
-            logger.error("kalshi_orderbook_failed", market=market_id, error=str(e))
-            return OrderBook()
+        for attempt in range(3):
+            try:
+                resp = await self._client.get(
+                    f"/trade-api/v2/markets/{market_id}/orderbook",
+                    params={"depth": 10},
+                )
+                if resp.status_code == 429:
+                    await asyncio.sleep(1.0 * (attempt + 1))
+                    continue
+                resp.raise_for_status()
+                data = resp.json().get("orderbook", {})
+                return self._parse_orderbook(data)
+            except httpx.HTTPStatusError:
+                raise
+            except Exception as e:
+                if attempt < 2:
+                    await asyncio.sleep(0.5)
+                else:
+                    logger.error("kalshi_orderbook_failed", market=market_id, error=str(e))
+                    return OrderBook()
+        logger.warning("kalshi_orderbook_rate_limited", market=market_id)
+        return OrderBook()
 
     async def place_order(
         self,
