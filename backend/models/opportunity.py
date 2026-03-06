@@ -17,6 +17,7 @@ class OpportunityStatus(str, Enum):
 class ArbLeg(BaseModel):
     platform: Platform
     market_id: str
+    title: str = Field(default="", description="Original market title on this platform")
     side: str = Field(..., description="YES or NO")
     price_cents: float = Field(..., gt=0, lt=100)
     available_qty: int = Field(default=0, ge=0)

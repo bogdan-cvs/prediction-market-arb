@@ -1,4 +1,4 @@
-import { centsToPrice, centsToDollars, profitColor, platformLabel } from '../utils/formatting'
+import { centsToPrice, centsToDollars, profitColor, platformLabel, marketUrl } from '../utils/formatting'
 
 export default function OpportunityTable({ opportunities, onSelect, selectedId }) {
   if (!opportunities.length) {
@@ -42,21 +42,51 @@ export default function OpportunityTable({ opportunities, onSelect, selectedId }
               <td className="py-2 pr-3 max-w-[400px]" title={opp.market_title}>
                 <span className="break-words">{opp.market_title}</span>
               </td>
-              <td className="py-2 pr-3">
-                <span className="text-xs px-1.5 py-0.5 rounded bg-gray-800">
-                  {platformLabel(opp.leg_a?.platform)}
-                </span>
-                <span className="ml-1 text-gray-300">
-                  {opp.leg_a?.side} @ {centsToPrice(opp.leg_a?.price_cents)}
-                </span>
+              <td className="py-2 pr-3 max-w-[280px]">
+                <div>
+                  <span className="text-xs px-1.5 py-0.5 rounded bg-gray-800">
+                    {platformLabel(opp.leg_a?.platform)}
+                  </span>
+                  <span className="ml-1 text-gray-300">
+                    {opp.leg_a?.side} @ {centsToPrice(opp.leg_a?.price_cents)}
+                  </span>
+                </div>
+                {opp.leg_a?.title && (
+                  <div className="text-xs text-gray-500 mt-0.5 break-words">
+                    <a
+                      href={marketUrl(opp.leg_a.platform, opp.leg_a.market_id)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="hover:text-gray-300 underline decoration-dotted"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      {opp.leg_a.title}
+                    </a>
+                  </div>
+                )}
               </td>
-              <td className="py-2 pr-3">
-                <span className="text-xs px-1.5 py-0.5 rounded bg-gray-800">
-                  {platformLabel(opp.leg_b?.platform)}
-                </span>
-                <span className="ml-1 text-gray-300">
-                  {opp.leg_b?.side} @ {centsToPrice(opp.leg_b?.price_cents)}
-                </span>
+              <td className="py-2 pr-3 max-w-[280px]">
+                <div>
+                  <span className="text-xs px-1.5 py-0.5 rounded bg-gray-800">
+                    {platformLabel(opp.leg_b?.platform)}
+                  </span>
+                  <span className="ml-1 text-gray-300">
+                    {opp.leg_b?.side} @ {centsToPrice(opp.leg_b?.price_cents)}
+                  </span>
+                </div>
+                {opp.leg_b?.title && (
+                  <div className="text-xs text-gray-500 mt-0.5 break-words">
+                    <a
+                      href={marketUrl(opp.leg_b.platform, opp.leg_b.market_id)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="hover:text-gray-300 underline decoration-dotted"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      {opp.leg_b.title}
+                    </a>
+                  </div>
+                )}
               </td>
               <td className="py-2 pr-3 text-right text-gray-300">
                 {centsToPrice(opp.total_cost_cents)}

@@ -35,6 +35,20 @@ export function platformColor(platform) {
   return colors[platform] || 'bg-gray-600'
 }
 
+export function marketUrl(platform, marketId) {
+  if (platform === 'kalshi') {
+    // Kalshi market ticker format: KXPGATOP20-ARPIPBM26-PCOO
+    // Event ticker is everything except the last segment
+    const parts = marketId.split('-')
+    const eventTicker = parts.slice(0, -1).join('-')
+    return `https://kalshi.com/markets/${eventTicker}`
+  }
+  if (platform === 'polymarket') {
+    return `https://polymarket.com/event/${marketId}`
+  }
+  return '#'
+}
+
 export function timeAgo(dateStr) {
   if (!dateStr) return ''
   const diff = Date.now() - new Date(dateStr).getTime()

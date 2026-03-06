@@ -350,6 +350,7 @@ class OpportunityScanner:
             leg_a=ArbLeg(
                 platform=plat_a,
                 market_id=market_a.platform_market_id,
+                title=market_a.title,
                 side=side_a,
                 price_cents=price_a,
                 available_qty=avail_a,
@@ -357,6 +358,7 @@ class OpportunityScanner:
             leg_b=ArbLeg(
                 platform=plat_b,
                 market_id=market_b.platform_market_id,
+                title=market_b.title,
                 side=side_b,
                 price_cents=price_b,
                 available_qty=avail_b,
