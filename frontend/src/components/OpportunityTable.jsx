@@ -39,8 +39,8 @@ export default function OpportunityTable({ opportunities, onSelect, selectedId }
               }`}
               onClick={() => onSelect(opp)}
             >
-              <td className="py-2 pr-3 max-w-[200px] truncate" title={opp.market_title}>
-                {opp.market_title}
+              <td className="py-2 pr-3 max-w-[400px]" title={opp.market_title}>
+                <span className="break-words">{opp.market_title}</span>
               </td>
               <td className="py-2 pr-3">
                 <span className="text-xs px-1.5 py-0.5 rounded bg-gray-800">

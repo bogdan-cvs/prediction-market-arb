@@ -30,7 +30,7 @@ _scanner_task: asyncio.Task | None = None
 
 async def _push_opportunities(opps):
     """Callback: push new opportunities to frontend via WebSocket."""
-    data = [o.model_dump() for o in opps]
+    data = [o.model_dump(mode="json") for o in opps]
     await ws_manager.broadcast("opportunities", data)
 
 

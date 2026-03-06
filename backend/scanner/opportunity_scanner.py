@@ -4,7 +4,7 @@ import asyncio
 import time
 import uuid
 from itertools import combinations
-from typing import Any
+from typing import Any, Callable, Coroutine
 
 import structlog
 
@@ -18,6 +18,8 @@ from scanner.fee_calculator import total_fees_for_arb
 from scanner.liquidity_checker import get_best_ask, get_available_quantity
 
 logger = structlog.get_logger()
+
+BATCH_SIZE = 100
 
 
 class OpportunityScanner:
@@ -69,28 +71,10 @@ class OpportunityScanner:
             return market.ticker
         return market.platform_market_id
 
-    async def scan_once(self) -> list[ArbitrageOpportunity]:
-        """Run a single scan cycle across all matched markets."""
-        t0 = time.monotonic()
-
-        # Phase 1: sort matches by score (exact matches first), take top 300
-        sorted_matches = sorted(self.active_matches, key=lambda m: m.match_score, reverse=True)
-        top_matches = [m for m in sorted_matches if len(m.markets) >= 2][:300]
-
-        # Phase 1b: collect unique orderbook IDs
-        ob_keys: list[tuple[Platform, str]] = []
-        seen_ob: set[tuple[str, str]] = set()
-        for match in top_matches:
-            for platform, market in match.markets.items():
-                ob_id = self._orderbook_id(market)
-                key = (platform.value, ob_id)
-                if key not in seen_ob:
-                    seen_ob.add(key)
-                    ob_keys.append((platform, ob_id))
-
-        logger.info("scan_phase1", total_matches=len(self.active_matches), scanning=len(top_matches), orderbooks_needed=len(ob_keys))
-
-        # Phase 2: fetch orderbooks concurrently (semaphore = 10 to balance speed vs rate limits)
+    async def _fetch_orderbooks(
+        self, ob_keys: list[tuple[Platform, str]]
+    ) -> dict[tuple[str, str], OrderBook]:
+        """Fetch orderbooks concurrently with semaphore."""
         sem = asyncio.Semaphore(10)
 
         async def _fetch_ob(plat: Platform, mid: str) -> tuple[str, str, OrderBook]:
@@ -104,10 +88,16 @@ class OpportunityScanner:
         ob_map: dict[tuple[str, str], OrderBook] = {}
         for pval, mid, ob in results:
             ob_map[(pval, mid)] = ob
+        return ob_map
 
-        # Phase 3: evaluate top matches using pre-fetched orderbooks
+    def _evaluate_matches(
+        self,
+        matches: list[MatchedMarket],
+        ob_map: dict[tuple[str, str], OrderBook],
+    ) -> list[ArbitrageOpportunity]:
+        """Evaluate a list of matches against orderbook data."""
         opportunities: list[ArbitrageOpportunity] = []
-        for match in top_matches:
+        for match in matches:
             platforms = list(match.markets.keys())
             if len(platforms) < 2:
                 continue
@@ -123,25 +113,170 @@ class OpportunityScanner:
                     )
                     if opp:
                         opportunities.append(opp)
+        return opportunities
 
-        opportunities.sort(key=lambda o: o.net_profit_cents, reverse=True)
-        self.opportunities = opportunities
+    async def _revalidate_opportunities(
+        self, opps: list[ArbitrageOpportunity]
+    ) -> list[ArbitrageOpportunity]:
+        """Re-fetch orderbooks for active opportunities and keep only still-valid ones."""
+        if not opps:
+            return []
+
+        # Collect unique orderbook keys needed for re-validation
+        ob_keys: list[tuple[Platform, str]] = []
+        seen: set[tuple[str, str]] = set()
+        # We need match data to re-evaluate, build a lookup
+        match_lookup: dict[str, MatchedMarket] = {
+            m.match_id: m for m in self.active_matches
+        }
+
+        for opp in opps:
+            for leg in [opp.leg_a, opp.leg_b]:
+                match = match_lookup.get(opp.match_id)
+                if not match:
+                    continue
+                market = match.markets.get(leg.platform)
+                if not market:
+                    continue
+                ob_id = self._orderbook_id(market)
+                key = (leg.platform.value, ob_id)
+                if key not in seen:
+                    seen.add(key)
+                    ob_keys.append((leg.platform, ob_id))
+
+        if not ob_keys:
+            return []
+
+        # Fetch fresh orderbooks
+        ob_map = await self._fetch_orderbooks(ob_keys)
+
+        # Re-evaluate each opportunity
+        valid: list[ArbitrageOpportunity] = []
+        for opp in opps:
+            match = match_lookup.get(opp.match_id)
+            if not match:
+                continue
+            market_a = match.markets.get(opp.leg_a.platform)
+            market_b = match.markets.get(opp.leg_b.platform)
+            if not market_a or not market_b:
+                continue
+
+            ob_a = ob_map.get((opp.leg_a.platform.value, self._orderbook_id(market_a)), OrderBook())
+            ob_b = ob_map.get((opp.leg_b.platform.value, self._orderbook_id(market_b)), OrderBook())
+
+            new_opp = self._evaluate_pair(
+                match,
+                opp.leg_a.platform, market_a, ob_a, opp.leg_a.side,
+                opp.leg_b.platform, market_b, ob_b, opp.leg_b.side,
+            )
+            if new_opp:
+                valid.append(new_opp)
+
+        logger.info(
+            "revalidation_done",
+            before=len(opps),
+            after=len(valid),
+            orderbooks_fetched=len(ob_keys),
+        )
+        return valid
+
+    async def scan_once(self, callback=None) -> list[ArbitrageOpportunity]:
+        """Run a single scan cycle across all matched markets in batches.
+
+        After each batch of BATCH_SIZE matches:
+        - New opportunities are added
+        - All existing opportunities are re-validated with fresh orderbooks
+        - Results are pushed to frontend via callback
+        """
+        t0 = time.monotonic()
+
+        # Sort matches by score (exact matches first), scan ALL
+        sorted_matches = sorted(self.active_matches, key=lambda m: m.match_score, reverse=True)
+        all_matches = [m for m in sorted_matches if len(m.markets) >= 2]
+
+        total_batches = (len(all_matches) + BATCH_SIZE - 1) // BATCH_SIZE
+        logger.info(
+            "scan_start",
+            total_matches=len(self.active_matches),
+            scanning=len(all_matches),
+            batches=total_batches,
+            batch_size=BATCH_SIZE,
+            carry_over=len(self.opportunities),
+        )
+
+        # Start with opportunities from previous cycle as baseline
+        all_opportunities: list[ArbitrageOpportunity] = list(self.opportunities)
+        total_ob_fetched = 0
+
+        for batch_idx in range(total_batches):
+            if not self._running:
+                break
+
+            batch_start = batch_idx * BATCH_SIZE
+            batch_end = min(batch_start + BATCH_SIZE, len(all_matches))
+            batch = all_matches[batch_start:batch_end]
+
+            # Collect unique orderbook IDs for this batch
+            ob_keys: list[tuple[Platform, str]] = []
+            seen_ob: set[tuple[str, str]] = set()
+            for match in batch:
+                for platform, market in match.markets.items():
+                    ob_id = self._orderbook_id(market)
+                    key = (platform.value, ob_id)
+                    if key not in seen_ob:
+                        seen_ob.add(key)
+                        ob_keys.append((platform, ob_id))
+
+            # Fetch orderbooks for this batch
+            ob_map = await self._fetch_orderbooks(ob_keys)
+            total_ob_fetched += len(ob_keys)
+
+            # Evaluate this batch
+            new_opps = self._evaluate_matches(batch, ob_map)
+
+            # De-duplicate: don't add if same match+sides already in list
+            existing_keys = {
+                (o.match_id, o.leg_a.side, o.leg_b.side) for o in all_opportunities
+            }
+            for opp in new_opps:
+                key = (opp.match_id, opp.leg_a.side, opp.leg_b.side)
+                if key not in existing_keys:
+                    all_opportunities.append(opp)
+                    existing_keys.add(key)
+
+            # Re-validate ALL accumulated opportunities with fresh orderbooks
+            all_opportunities = await self._revalidate_opportunities(all_opportunities)
+
+            # Sort and update
+            all_opportunities.sort(key=lambda o: o.net_profit_cents, reverse=True)
+            self.opportunities = all_opportunities
+
+            logger.info(
+                "scan_batch_done",
+                batch=f"{batch_idx + 1}/{total_batches}",
+                matches_in_batch=len(batch),
+                new_opps=len(new_opps),
+                total_valid=len(all_opportunities),
+                ob_fetched=len(ob_keys),
+            )
+
+            # Push update to frontend after each batch
+            if callback and all_opportunities:
+                await callback(all_opportunities)
 
         elapsed = round(time.monotonic() - t0, 2)
-        skipped = len([k for k in ob_keys if (k[0].value, k[1]) in self._ob_fail_cache])
-        if opportunities:
+        if all_opportunities:
             logger.info(
                 "scan_complete",
-                count=len(opportunities),
-                best_profit_cents=opportunities[0].net_profit_cents,
+                count=len(all_opportunities),
+                best_profit_cents=all_opportunities[0].net_profit_cents,
                 elapsed_sec=elapsed,
-                orderbooks_fetched=len(ob_keys) - skipped,
-                orderbooks_cached_skip=skipped,
+                total_ob_fetched=total_ob_fetched,
             )
         else:
-            logger.info("scan_complete", count=0, elapsed_sec=elapsed)
+            logger.info("scan_complete", count=0, elapsed_sec=elapsed, total_ob_fetched=total_ob_fetched)
 
-        return opportunities
+        return all_opportunities
 
     def _evaluate_pair(
         self,
@@ -259,11 +394,8 @@ class OpportunityScanner:
         scan_count = 0
         while self._running:
             try:
-                opps = await self.scan_once()
+                opps = await self.scan_once(callback=callback)
                 scan_count += 1
-
-                if callback and opps:
-                    await callback(opps)
 
                 # Refresh matches every 50 scans
                 if scan_count % 50 == 0:
